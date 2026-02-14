@@ -4,7 +4,7 @@ This project implements a **hybrid numerical solver** that integrates the high-o
 
 The goal is to use KAN to learn and correct the truncation errors of the WENO5 solver on coarse grids, effectively achieving high-resolution accuracy with low-resolution computational cost.
 
-##  Key Features
+## Key Features
 
 * **Core Solver**: Vectorized WENO5 implementation with Lax-Friedrichs flux splitting and TVD RK3 time integration.
 * **Residual Learning**: Uses KAN to predict numerical errors based on local stencils.
@@ -22,6 +22,10 @@ The goal is to use KAN to learn and correct the truncation errors of the WENO5 s
 
 ### 1. Prerequisites
 Ensure you have `torch`, `numpy`, `matplotlib`, and `scikit-learn` installed.
+
+```bash
+pip install -r requirements.txt
+```
 
 ### 2. Workflow
 
