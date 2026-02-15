@@ -125,6 +125,11 @@ def main():
         return
     
     # 2. 预处理
+    
+    
+    print(np.mean(np.abs(y)))
+    print(np.max(np.abs(y)))
+
     scaler_X = StandardScaler()
     X_scaled = scaler_X.fit_transform(X)
     
