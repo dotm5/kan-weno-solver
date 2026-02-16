@@ -79,12 +79,16 @@ def run_evaluation(model_path='kan_model.pth'):
         history['l2_base'].append(np.sqrt(np.mean((u_coarse - u_truth_down)**2)))
         history['l2_hybrid'].append(np.sqrt(np.mean((u_hybrid - u_truth_down)**2)))
 
-    plt.figure(figsize=(10, 5))
-    plt.plot(history['time'], history['l2_base'], 'k--', label='Baseline (WENO5)')
-    plt.plot(history['time'], history['l2_hybrid'], 'r-', label='Hybrid (WENO5+KAN)')
-    plt.yscale('log'); plt.legend(); plt.title('L2 Error Comparison'); plt.grid(True)
-    plt.savefig('evaluation_result.png')
-    print("Evaluation complete. Results saved to 'evaluation_result.png'.")
+    try:
+        plt.figure(figsize=(10, 5))
+        plt.plot(history['time'], history['l2_base'], 'k--', label='Baseline (WENO5)')
+        plt.plot(history['time'], history['l2_hybrid'], 'r-', label='Hybrid (WENO5+KAN)')
+        plt.yscale('log'); plt.legend(); plt.title('L2 Error Comparison'); plt.grid(True)
+        plt.savefig('evaluation_result.png')
+        print("Evaluation complete. Results saved to 'evaluation_result.png'.")
+    except Exception as e:
+        print(f"Plotting failed (expected in some CI environments): {e}")
+        print("Evaluation numeric data collected successfully.")
 
 if __name__ == "__main__":
     run_evaluation()
