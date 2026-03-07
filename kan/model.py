@@ -145,13 +145,18 @@ class GatedKAN(nn.Module):
         shock_indicator = F.relu(abs_ux - self.shock_indicator_threshold)
         return torch.cat([x_physics, curvature_ratio, shock_indicator], dim=1)
 
-    def forward(self, x):
+    def forward_components(self, x):
         x_physics = x[:, self.stencil_size:]
 
         raw_correction = self.shape_net(x)
         raw_correction = F.softsign(raw_correction) * self.shape_output_scale
 
         gate_logits = self.gate_net(self._build_gate_input(x_physics))
-        gate = torch.sigmoid(gate_logits / self.gate_temperature)
+        raw_gate = torch.sigmoid(gate_logits / self.gate_temperature)
+        gated_correction = raw_correction * raw_gate
+        return raw_correction, raw_gate, gated_correction
 
-        return raw_correction * gate, gate
+    def forward(self, x):
+        """训练默认路径：直接返回与训练一致的 gated correction。"""
+        _, gate, gated_correction = self.forward_components(x)
+        return gated_correction, gate

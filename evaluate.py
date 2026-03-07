@@ -1,35 +1,36 @@
 import argparse
+import warnings
 from pathlib import Path
 
-import torch
-import torch.nn.functional as F
-import numpy as np
 import matplotlib
-matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import numpy as np
+import torch
 
+matplotlib.use("Agg")
+
+from kan import GatedKAN, HybridScaler, TargetAffineScaler
 from solvers.weno import rk3_step
-from numpy.lib.stride_tricks import sliding_window_view
-from data.generate import get_multistep_error
-from kan import GatedKAN, HybridScaler
-from utils.config import load_config, set_global_seed
+from utils.config import cfg_get, load_config, set_global_seed
+from utils.features import build_model_inputs, downsample_periodic, physics_feature_names, require_integer_refinement
+from utils.metadata import (
+    default_target_scaling_metadata,
+    extract_checkpoint_metadata,
+    infer_default_sign,
+    validate_one_step_metadata,
+)
 
 
-class TargetAffineScaler:
-    """Affine target scaler used during train/eval checkpoint exchange."""
-
-    def __init__(self, eps=1e-12):
-        self.eps = eps
-        self.mean = 0.0
-        self.std = 1.0
-
-    def load_state_dict(self, state):
-        self.mean = float(state.get("mean", 0.0))
-        std = float(state.get("std", 1.0))
-        self.std = std if std >= self.eps else 1.0
-
-    def inverse_transform(self, y):
-        return y * self.std + self.mean
+def _normalize_gate_mode(mode: str) -> str:
+    mode_l = str(mode).lower()
+    if mode_l == "original":
+        warnings.warn(
+            "gate_mode='original' is deprecated; using 'hard_mask' instead.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return "hard_mask"
+    return mode_l
 
 
 class KANPredictor:
@@ -37,19 +38,20 @@ class KANPredictor:
     Predictor with configurable gate policy.
 
     gate_mode options:
-      - original:      effective_gate = raw_gate * hard_mask
-      - raw_gate_only: effective_gate = raw_gate
-      - gate_open:     effective_gate = 1
-      - soft_mask:     effective_gate = raw_gate * soft_mask (recommended)
+      - train_equivalent: use the exact gated output path seen during training
+      - raw_gate_only:    recompute raw_corr * raw_gate
+      - soft_mask:        effective_gate = raw_gate * soft_mask
+      - hard_mask:        effective_gate = raw_gate * hard_mask
+      - gate_open:        effective_gate = 1
     """
 
     def __init__(
         self,
         model_path,
-        device='cpu',
+        device="cpu",
         model_cfg=None,
         scaler_cfg=None,
-        gate_mode='soft_mask',
+        gate_mode="train_equivalent",
         hard_gate_sensor_threshold=0.1,
         soft_mask_center=0.1,
         soft_mask_width=0.08,
@@ -57,12 +59,14 @@ class KANPredictor:
         correction_clip_abs=None,
         debug_rollout=False,
         debug_t_start=1.0,
+        metadata_cfg=None,
     ):
         self.device = device
         self.model_cfg = model_cfg or {}
         self.scaler_cfg = scaler_cfg or {}
+        self.metadata_cfg = metadata_cfg or {}
 
-        self.gate_mode = gate_mode
+        self.gate_mode = _normalize_gate_mode(gate_mode)
         self.hard_gate_sensor_threshold = float(hard_gate_sensor_threshold)
         self.soft_mask_center = float(soft_mask_center)
         self.soft_mask_width = float(max(soft_mask_width, 1e-6))
@@ -72,12 +76,68 @@ class KANPredictor:
         self.debug_t_start = float(debug_t_start)
 
         checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-        self.stencil_size = checkpoint.get('stencil_size', 9)
-        self.phys_dim = checkpoint.get('phys_dim', 3)
-        self.steps_ahead = checkpoint.get('steps_ahead', 10)
+        warn_on_missing = bool(self.metadata_cfg.get("warn_on_missing", True))
+        strict_metadata = bool(self.metadata_cfg.get("strict", True))
 
-        # 优先使用 checkpoint 中保存的模型配置，避免结构不匹配。
-        ckpt_model_cfg = checkpoint.get('config', {}).get('model', {}) if isinstance(checkpoint.get('config', {}), dict) else {}
+        self.metadata = extract_checkpoint_metadata(
+            checkpoint,
+            source_label=str(model_path),
+            warn_on_missing=warn_on_missing,
+        )
+        self.metadata.setdefault("steps_ahead", int(checkpoint.get("steps_ahead", 1)))
+        self.metadata.setdefault("stencil_size", int(checkpoint.get("stencil_size", 9)))
+        self.metadata.setdefault("phys_dim", int(checkpoint.get("phys_dim", 7)))
+        self.metadata.setdefault("physics_feature_names", physics_feature_names(int(self.metadata["phys_dim"])))
+
+        has_target_scaler_state = "target_scaler_state" in checkpoint
+        if "target_scaling" not in self.metadata:
+            if warn_on_missing:
+                warnings.warn(
+                    f"{model_path}: target_scaling metadata missing, inferring from checkpoint fields.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            self.metadata["target_scaling"] = default_target_scaling_metadata(
+                target_scaler_enabled=has_target_scaler_state
+            )
+
+        try:
+            validate_one_step_metadata(
+                self.metadata,
+                source_label=str(model_path),
+                expected_steps_ahead=1,
+                expected_stencil_size=int(self.metadata["stencil_size"]),
+                expected_phys_dim=int(self.metadata["phys_dim"]),
+                expected_feature_names=physics_feature_names(int(self.metadata["phys_dim"])),
+                expected_target_scaling=default_target_scaling_metadata(
+                    target_scaler_enabled=bool(self.metadata["target_scaling"].get("state_required", has_target_scaler_state))
+                ),
+            )
+        except ValueError:
+            if strict_metadata:
+                raise
+            warnings.warn(
+                f"{model_path}: checkpoint metadata validation failed, continuing because metadata.strict=false.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        if bool(self.metadata["target_scaling"].get("state_required", False)) and not has_target_scaler_state:
+            raise ValueError(
+                "Checkpoint metadata requires target_scaler_state, but the state is missing. "
+                "This artifact is incompatible with strict one-step evaluation."
+            )
+
+        self.stencil_size = int(self.metadata["stencil_size"])
+        self.phys_dim = int(self.metadata["phys_dim"])
+        self.steps_ahead = int(self.metadata.get("steps_ahead", 1))
+        self.default_correction_sign = infer_default_sign(self.metadata)
+        if self.steps_ahead != 1:
+            raise ValueError(
+                f"Checkpoint uses steps_ahead={self.steps_ahead}; strict one-step correction requires 1."
+            )
+
+        ckpt_model_cfg = checkpoint.get("config", {}).get("model", {}) if isinstance(checkpoint.get("config", {}), dict) else {}
         model_cfg = dict(self.model_cfg)
         model_cfg.update(ckpt_model_cfg)
 
@@ -86,20 +146,21 @@ class KANPredictor:
             eps=float(self.scaler_cfg.get("eps", 1e-8)),
             clip_percentile_abs_features=float(self.scaler_cfg.get("clip_percentile_abs_features", 99.5)),
         )
-        self.scaler.load_state_dict(checkpoint['scaler_state'])
+        self.scaler.load_state_dict(checkpoint["scaler_state"])
 
         self.target_scaler = TargetAffineScaler()
-        if 'target_scaler_state' in checkpoint:
-            self.target_scaler.load_state_dict(checkpoint['target_scaler_state'])
+        if has_target_scaler_state:
+            self.target_scaler.load_state_dict(checkpoint["target_scaler_state"])
             print(
                 "Target scaler loaded: "
                 f"y_mean={self.target_scaler.mean:.3e}, "
                 f"y_std={self.target_scaler.std:.3e}"
             )
         else:
-            print(
-                "Target scaler missing in checkpoint. "
-                "Using identity fallback: y_mean=0.000e+00, y_std=1.000e+00"
+            warnings.warn(
+                "Target scaler missing in checkpoint. Falling back to identity inverse transform.",
+                RuntimeWarning,
+                stacklevel=2,
             )
 
         self.model = GatedKAN(
@@ -116,7 +177,7 @@ class KANPredictor:
             curvature_eps=float(model_cfg.get("curvature_eps", 1e-4)),
         ).to(device)
 
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.model.load_state_dict(checkpoint["model_state_dict"])
         self.model.eval()
 
         print(
@@ -126,55 +187,10 @@ class KANPredictor:
             f"soft_floor={self.soft_mask_floor:.3f}, corr_clip_abs={self.correction_clip_abs}"
         )
 
-    def _physics_features(self, u_current, dx, dt, t_stamp):
-        u_x = np.gradient(u_current, dx)
-        abs_ux = np.abs(u_x)
-
-        if self.phys_dim >= 7:
-            u_xx = np.gradient(u_x, dx)
-            abs_uxx = np.abs(u_xx)
-            grad_var = np.sqrt(
-                (
-                    (np.roll(u_x, -1) - u_x) ** 2
-                    + (np.roll(u_x, 1) - u_x) ** 2
-                ) * 0.5
-            )
-            dt_feat = np.full_like(u_x, dt)
-            t_sin = np.full_like(u_x, np.sin(t_stamp))
-            t_cos = np.full_like(u_x, np.cos(t_stamp))
-            return np.stack([u_x, abs_ux, abs_uxx, grad_var, dt_feat, t_sin, t_cos], axis=1)
-
-        if self.phys_dim == 3:
-            dt_feat = np.full_like(u_x, dt)
-            return np.stack([u_x, abs_ux, dt_feat], axis=1)
-
-        feats = [u_x, abs_ux]
-        while len(feats) < self.phys_dim:
-            feats.append(np.zeros_like(u_x))
-        return np.stack(feats[:self.phys_dim], axis=1)
-
     def _shock_sensor_from_inputs(self, inputs_norm):
-        # 与训练一致：使用归一化后的 |u_x| 通道。
         shock_idx = self.stencil_size + (1 if self.phys_dim > 1 else 0)
         sensor = inputs_norm[:, shock_idx]
         return np.clip(sensor, 0.0, 1.0)
-
-    def _forward_components(self, inputs_tensor):
-        x_physics = inputs_tensor[:, self.stencil_size:]
-        raw_output = self.model.shape_net(inputs_tensor)
-        raw_output = F.softsign(raw_output) * self.model.shape_output_scale
-
-        if hasattr(self.model, '_build_gate_input'):
-            gate_input = self.model._build_gate_input(x_physics)
-        else:
-            gate_input = x_physics
-
-        gate_logits = self.model.gate_net(gate_input)
-        gate_temperature = getattr(self.model, 'gate_temperature', 1.0)
-        gate_raw = torch.sigmoid(gate_logits / gate_temperature)
-
-        gated_output = raw_output * gate_raw
-        return raw_output, gate_raw, gated_output
 
     def _soft_mask(self, shock_sensor):
         z = (shock_sensor - self.soft_mask_center) / self.soft_mask_width
@@ -182,102 +198,108 @@ class KANPredictor:
         mask = self.soft_mask_floor + (1.0 - self.soft_mask_floor) * mask
         return np.clip(mask, 0.0, 1.0)
 
-    def _effective_gate(self, gate_raw, shock_sensor, t_stamp):
+    def _effective_gate(self, gate_raw, shock_sensor):
         hard_mask = (shock_sensor >= self.hard_gate_sensor_threshold).astype(np.float32)
         soft_mask = self._soft_mask(shock_sensor).astype(np.float32)
 
-        if self.gate_mode == 'original':
-            eff = gate_raw * hard_mask
-            mode = 'ORIGINAL'
-            mask_for_stats = hard_mask
-        elif self.gate_mode == 'raw_gate_only':
+        if self.gate_mode == "train_equivalent":
             eff = gate_raw
-            mode = 'RAW_GATE_ONLY'
+            mode = "TRAIN_EQUIVALENT"
             mask_for_stats = np.ones_like(hard_mask, dtype=np.float32)
-        elif self.gate_mode == 'gate_open':
-            eff = np.ones_like(gate_raw, dtype=np.float32)
-            mode = 'GATE_OPEN'
+        elif self.gate_mode == "raw_gate_only":
+            eff = gate_raw
+            mode = "RAW_GATE_ONLY"
             mask_for_stats = np.ones_like(hard_mask, dtype=np.float32)
-        elif self.gate_mode == 'soft_mask':
+        elif self.gate_mode == "soft_mask":
             eff = gate_raw * soft_mask
-            mode = 'SOFT_MASK'
+            mode = "SOFT_MASK"
             mask_for_stats = (soft_mask > 0.5).astype(np.float32)
+        elif self.gate_mode == "hard_mask":
+            eff = gate_raw * hard_mask
+            mode = "HARD_MASK"
+            mask_for_stats = hard_mask
+        elif self.gate_mode == "gate_open":
+            eff = np.ones_like(gate_raw, dtype=np.float32)
+            mode = "GATE_OPEN"
+            mask_for_stats = np.ones_like(hard_mask, dtype=np.float32)
         else:
             raise ValueError(f"Unsupported gate_mode: {self.gate_mode}")
 
-        if self.debug_rollout and t_stamp > self.debug_t_start:
-            eff = np.ones_like(gate_raw, dtype=np.float32)
-            mode = 'FORCE_OPEN_DEBUG'
-
         return np.clip(eff, 0.0, 1.0), hard_mask, soft_mask, mask_for_stats, mode
 
-    def predict(self, u_current, dx, dt, t_stamp=0.0, return_debug=False):
-        pad = self.stencil_size // 2
-        u_padded = np.pad(u_current, (pad, pad), mode='wrap')
-        stencils = sliding_window_view(u_padded, window_shape=self.stencil_size)
-
-        phys_feats = self._physics_features(u_current, dx, dt, t_stamp)
-        inputs_raw = np.hstack([stencils, phys_feats])
+    def predict(self, u_current, dx, dt, t_stamp=0.0, return_debug=False, return_components=False):
+        inputs_raw = build_model_inputs(
+            u_current,
+            stencil_size=self.stencil_size,
+            dx=dx,
+            dt=dt,
+            t_stamp=t_stamp,
+            phys_dim=self.phys_dim,
+        )
         inputs_norm = self.scaler.transform(inputs_raw)
-        inputs_tensor = torch.FloatTensor(inputs_norm).to(self.device)
+        inputs_tensor = torch.as_tensor(inputs_norm, dtype=torch.float32, device=self.device)
 
         with torch.no_grad():
-            raw_output_z, gate_raw_t, _ = self._forward_components(inputs_tensor)
+            raw_output_z_t, gate_raw_t, gated_output_z_t = self.model.forward_components(inputs_tensor)
 
-            raw_output_z_np = raw_output_z.cpu().numpy()
-            gate_raw_np = gate_raw_t.cpu().numpy().flatten()
+            raw_output_z = raw_output_z_t.cpu().numpy()
+            gate_raw = gate_raw_t.cpu().numpy().flatten()
+            gated_output_z = gated_output_z_t.cpu().numpy()
             shock_sensor = self._shock_sensor_from_inputs(inputs_norm)
 
             effective_gate, hard_mask, soft_mask, mask_for_stats, mode = self._effective_gate(
-                gate_raw_np, shock_sensor, t_stamp
+                gate_raw, shock_sensor
             )
 
-            corr_z = raw_output_z_np * effective_gate[:, None]
-            corr_phys = self.target_scaler.inverse_transform(corr_z)
-            corr_raw_phys = self.target_scaler.inverse_transform(raw_output_z_np)
+            if self.gate_mode == "train_equivalent":
+                corr_z = gated_output_z
+            else:
+                corr_z = raw_output_z * effective_gate[:, None]
+
+            corr_phys = self.target_scaler.inverse_transform(corr_z).reshape(-1)
+            corr_raw_phys = self.target_scaler.inverse_transform(raw_output_z).reshape(-1)
 
             if self.correction_clip_abs is not None:
                 corr_phys = np.clip(corr_phys, -self.correction_clip_abs, self.correction_clip_abs)
                 corr_raw_phys = np.clip(corr_raw_phys, -self.correction_clip_abs, self.correction_clip_abs)
 
-            corr_final = corr_phys.flatten() / self.steps_ahead
-            corr_raw_final = corr_raw_phys.flatten() / self.steps_ahead
-
             debug_metrics = {
-                'mode': mode,
-                'shock_indicator_min': float(np.min(shock_sensor)),
-                'shock_indicator_mean': float(np.mean(shock_sensor)),
-                'shock_indicator_max': float(np.max(shock_sensor)),
-                'raw_gate_min': float(np.min(gate_raw_np)),
-                'raw_gate_mean': float(np.mean(gate_raw_np)),
-                'raw_gate_max': float(np.max(gate_raw_np)),
-                'effective_gate_min': float(np.min(effective_gate)),
-                'effective_gate_mean': float(np.mean(effective_gate)),
-                'effective_gate_max': float(np.max(effective_gate)),
-                'mask_active_ratio': float(np.mean(mask_for_stats)),
-                'hard_mask_active_ratio': float(np.mean(hard_mask)),
-                'soft_mask_mean': float(np.mean(soft_mask)),
-                'kan_raw_abs_mean': float(np.mean(np.abs(raw_output_z_np))),
-                'kan_raw_abs_max': float(np.max(np.abs(raw_output_z_np))),
-                'corr_before_gate_abs_mean': float(np.mean(np.abs(corr_raw_final))),
-                'corr_before_gate_abs_max': float(np.max(np.abs(corr_raw_final))),
-                'corr_after_gate_abs_mean': float(np.mean(np.abs(corr_final))),
-                'corr_after_gate_abs_max': float(np.max(np.abs(corr_final))),
-                'corr_abs_mean': float(np.mean(np.abs(corr_final))),
-                'corr_abs_max': float(np.max(np.abs(corr_final))),
+                "mode": mode,
+                "shock_indicator_min": float(np.min(shock_sensor)),
+                "shock_indicator_mean": float(np.mean(shock_sensor)),
+                "shock_indicator_max": float(np.max(shock_sensor)),
+                "raw_gate_min": float(np.min(gate_raw)),
+                "raw_gate_mean": float(np.mean(gate_raw)),
+                "raw_gate_max": float(np.max(gate_raw)),
+                "effective_gate_min": float(np.min(effective_gate)),
+                "effective_gate_mean": float(np.mean(effective_gate)),
+                "effective_gate_max": float(np.max(effective_gate)),
+                "mask_active_ratio": float(np.mean(mask_for_stats)),
+                "hard_mask_active_ratio": float(np.mean(hard_mask)),
+                "soft_mask_mean": float(np.mean(soft_mask)),
+                "kan_raw_abs_mean": float(np.mean(np.abs(raw_output_z))),
+                "kan_raw_abs_max": float(np.max(np.abs(raw_output_z))),
+                "corr_before_gate_abs_mean": float(np.mean(np.abs(corr_raw_phys))),
+                "corr_before_gate_abs_max": float(np.max(np.abs(corr_raw_phys))),
+                "corr_after_gate_abs_mean": float(np.mean(np.abs(corr_phys))),
+                "corr_after_gate_abs_max": float(np.max(np.abs(corr_phys))),
+                "corr_abs_mean": float(np.mean(np.abs(corr_phys))),
+                "corr_abs_max": float(np.max(np.abs(corr_phys))),
             }
 
-            if return_debug:
+            if return_debug and return_components:
                 components = {
-                    'shock_sensor': shock_sensor,
-                    'raw_gate': gate_raw_np,
-                    'effective_gate': effective_gate,
-                    'mask_for_stats': mask_for_stats,
-                    'corr_before_gate': corr_raw_final,
-                    'corr_after_gate': corr_final,
+                    "shock_sensor": shock_sensor,
+                    "raw_gate": gate_raw,
+                    "effective_gate": effective_gate,
+                    "mask_for_stats": mask_for_stats,
+                    "corr_before_gate": corr_raw_phys,
+                    "corr_after_gate": corr_phys,
                 }
-                return corr_final, debug_metrics, components
-            return corr_final, None, None
+                return corr_phys, debug_metrics, components
+            if return_debug:
+                return corr_phys, debug_metrics
+            return corr_phys, None
 
 
 def _resolve_device(runtime_cfg):
@@ -337,12 +359,17 @@ def _apply_legacy_overrides(cfg, legacy_kwargs):
     return cfg
 
 
-def _resolve_correction_sign_mode(mode):
+def _resolve_correction_sign_mode(mode, metadata):
     mode_l = str(mode).lower()
-    if mode_l in ("auto", "plus"):
-        return mode_l, 1.0
+    if mode_l == "auto":
+        resolved = infer_default_sign(metadata)
+        if resolved not in ("plus", "minus"):
+            raise ValueError(f"Unsupported inferred correction sign: {resolved}")
+        return resolved, (1.0 if resolved == "plus" else -1.0)
+    if mode_l == "plus":
+        return "plus", 1.0
     if mode_l == "minus":
-        return mode_l, -1.0
+        return "minus", -1.0
     raise ValueError(f"Unsupported correction_sign_mode: {mode}")
 
 
@@ -353,6 +380,10 @@ def _compute_pair_metrics(pred, true):
             'cosine_similarity': float('nan'),
             'sign_agreement_ratio': float('nan'),
             'correlation_coeff': float('nan'),
+            'pred_abs_mean': float('nan'),
+            'pred_abs_max': float('nan'),
+            'true_abs_mean': float('nan'),
+            'true_abs_max': float('nan'),
             'count': 0,
         }
 
@@ -370,6 +401,10 @@ def _compute_pair_metrics(pred, true):
         'cosine_similarity': cosine,
         'sign_agreement_ratio': sign_agree,
         'correlation_coeff': corr,
+        'pred_abs_mean': float(np.mean(np.abs(pred))),
+        'pred_abs_max': float(np.max(np.abs(pred))),
+        'true_abs_mean': float(np.mean(np.abs(true))),
+        'true_abs_max': float(np.max(np.abs(true))),
         'count': int(pred.size),
     }
 
@@ -405,41 +440,45 @@ def _run_rollout_once(
     debug_sign_metrics=False,
     debug_gate_metrics=False,
 ):
-    resolved_sign_mode, sign_factor = _resolve_correction_sign_mode(correction_sign_mode)
+    resolved_sign_mode, sign_factor = _resolve_correction_sign_mode(
+        correction_sign_mode, predictor.metadata
+    )
 
     sin1_amp = float(ic_cfg.get("sin1_amp", 1.0))
     sin2_amp = float(ic_cfg.get("sin2_amp", 0.5))
     sin2_phase = float(ic_cfg.get("sin2_phase", 0.5))
     cos5_amp = float(ic_cfg.get("cos5_amp", -0.2))
 
+    ref_substeps = require_integer_refinement(N_ref, N_coarse)
     x = np.linspace(0, 2 * np.pi, N_ref, endpoint=False)
     u_ref_init = sin1_amp * np.sin(x) + sin2_amp * np.sin(2 * x + sin2_phase) + cos5_amp * np.cos(5 * x)
     u_ref_init /= np.max(np.abs(u_ref_init))
 
-    u_coarse = u_ref_init[::(N_ref // N_coarse)].copy()
+    u_coarse = downsample_periodic(u_ref_init, ratio=ref_substeps)
     u_hybrid = u_coarse.copy()
     u_truth = u_ref_init.copy()
 
     t, dx_coarse, dx_ref = 0.0, 2 * np.pi / N_coarse, 2 * np.pi / N_ref
-    ref_substeps = N_ref // N_coarse
 
     history = {
-        'time': [],
-        'l2_base': [],
-        'l2_hybrid': [],
-        'raw_gate_mean': [],
-        'effective_gate_mean': [],
-        'mask_active_ratio': [],
-        'corr_abs_mean': [],
-        'baseline_update_abs_mean': [],
-        'corr_to_baseline_ratio': [],
+        "time": [],
+        "l2_base": [],
+        "l2_hybrid": [],
+        "raw_gate_mean": [],
+        "effective_gate_mean": [],
+        "mask_active_ratio": [],
+        "corr_abs_mean": [],
+        "corr_abs_max": [],
+        "baseline_update_abs_mean": [],
+        "baseline_update_abs_max": [],
+        "corr_to_baseline_ratio": [],
     }
 
     one_pred_buf, one_true_buf, one_shock_buf = [], [], []
-    train_pred_buf, train_true_buf, train_shock_buf = [], [], []
     gate_raw_buf, gate_eff_buf, gate_mask_buf = [], [], []
     shock_sensor_buf = []
     corr_before_gate_buf, corr_after_gate_buf = [], []
+    applied_corr_buf = []
 
     while t < T_final:
         dt = cfl * dx_coarse / (max(np.max(np.abs(u_coarse)), np.max(np.abs(u_hybrid))) + 1e-6)
@@ -452,51 +491,45 @@ def _run_rollout_once(
         u_coarse = rk3_step(u_coarse, dx_coarse, dt, nu=nu, weno_epsilon=weno_epsilon)
 
         u_hybrid_prev = u_hybrid.copy()
-        u_phys = rk3_step(u_hybrid, dx_coarse, dt, nu=nu, weno_epsilon=weno_epsilon)
+        u_weno_next = rk3_step(u_hybrid, dx_coarse, dt, nu=nu, weno_epsilon=weno_epsilon)
 
-        corr, dbg, components = predictor.predict(u_hybrid, dx_coarse, dt, t_stamp=t, return_debug=True)
+        corr, dbg, components = predictor.predict(
+            u_hybrid,
+            dx_coarse,
+            dt,
+            t_stamp=t,
+            return_debug=True,
+            return_components=True,
+        )
         pred_corr = corr.copy()
         corr_centered = corr - np.mean(corr) if remove_correction_mean else corr
         applied_corr = sign_factor * corr_centered
 
-        baseline_update = u_phys - u_hybrid_prev
+        baseline_update = u_weno_next - u_hybrid_prev
         base_abs_mean = float(np.mean(np.abs(baseline_update)))
         base_abs_max = float(np.max(np.abs(baseline_update)))
         corr_abs_mean = float(np.mean(np.abs(applied_corr)))
         corr_abs_max = float(np.max(np.abs(applied_corr)))
         corr_to_base = corr_abs_mean / (base_abs_mean + 1e-12)
 
-        u_truth_down = u_truth[::ref_substeps]
+        u_truth_down = downsample_periodic(u_truth, ratio=ref_substeps)
         if debug_sign_metrics:
-            shock_sensor = components['shock_sensor']
+            shock_sensor = components["shock_sensor"]
             shock_mask = shock_sensor >= predictor.hard_gate_sensor_threshold
-            one_true_corr = u_truth_down - u_phys
-            train_true_corr = (
-                get_multistep_error(
-                    u_hybrid_prev,
-                    N_coarse,
-                    N_ref,
-                    dt,
-                    predictor.steps_ahead,
-                    nu=nu,
-                    weno_epsilon=weno_epsilon,
-                ) / predictor.steps_ahead
-            )
+            one_true_corr = u_truth_down - u_weno_next
 
             one_pred_buf.append(pred_corr.copy())
             one_true_buf.append(one_true_corr.copy())
             one_shock_buf.append(shock_mask.copy())
-            train_pred_buf.append(pred_corr.copy())
-            train_true_buf.append(train_true_corr.copy())
-            train_shock_buf.append(shock_mask.copy())
 
         if debug_gate_metrics:
-            gate_raw_buf.append(components['raw_gate'].copy())
-            gate_eff_buf.append(components['effective_gate'].copy())
-            gate_mask_buf.append(components['mask_for_stats'].copy())
-            shock_sensor_buf.append(components['shock_sensor'].copy())
-            corr_before_gate_buf.append(components['corr_before_gate'].copy())
-            corr_after_gate_buf.append(components['corr_after_gate'].copy())
+            gate_raw_buf.append(components["raw_gate"].copy())
+            gate_eff_buf.append(components["effective_gate"].copy())
+            gate_mask_buf.append(components["mask_for_stats"].copy())
+            shock_sensor_buf.append(components["shock_sensor"].copy())
+            corr_before_gate_buf.append(components["corr_before_gate"].copy())
+            corr_after_gate_buf.append(components["corr_after_gate"].copy())
+            applied_corr_buf.append(applied_corr.copy())
 
         if debug_rollout and t > debug_t_start:
             print(
@@ -513,31 +546,33 @@ def _run_rollout_once(
                 f"corr/base={corr_to_base:.3e}"
             )
 
-        u_hybrid = u_phys + applied_corr
+        # 默认路径保持与训练一致的 one-step 加法语义。
+        u_hybrid = u_weno_next + applied_corr
         t += dt
 
-        history['time'].append(t)
-        history['l2_base'].append(np.sqrt(np.mean((u_coarse - u_truth_down) ** 2)))
-        history['l2_hybrid'].append(np.sqrt(np.mean((u_hybrid - u_truth_down) ** 2)))
-        history['raw_gate_mean'].append(dbg['raw_gate_mean'])
-        history['effective_gate_mean'].append(dbg['effective_gate_mean'])
-        history['mask_active_ratio'].append(dbg['mask_active_ratio'])
-        history['corr_abs_mean'].append(corr_abs_mean)
-        history['baseline_update_abs_mean'].append(base_abs_mean)
-        history['corr_to_baseline_ratio'].append(corr_to_base)
+        history["time"].append(t)
+        history["l2_base"].append(np.sqrt(np.mean((u_coarse - u_truth_down) ** 2)))
+        history["l2_hybrid"].append(np.sqrt(np.mean((u_hybrid - u_truth_down) ** 2)))
+        history["raw_gate_mean"].append(dbg["raw_gate_mean"])
+        history["effective_gate_mean"].append(dbg["effective_gate_mean"])
+        history["mask_active_ratio"].append(dbg["mask_active_ratio"])
+        history["corr_abs_mean"].append(corr_abs_mean)
+        history["corr_abs_max"].append(corr_abs_max)
+        history["baseline_update_abs_mean"].append(base_abs_mean)
+        history["baseline_update_abs_max"].append(base_abs_max)
+        history["corr_to_baseline_ratio"].append(corr_to_base)
 
     result = {
-        'history': history,
-        'resolved_sign_mode': resolved_sign_mode,
-        'sign_factor': sign_factor,
-        'final_l2_base': float(history['l2_base'][-1]),
-        'final_l2_hybrid': float(history['l2_hybrid'][-1]),
+        "history": history,
+        "resolved_sign_mode": resolved_sign_mode,
+        "sign_factor": sign_factor,
+        "final_l2_base": float(history["l2_base"][-1]),
+        "final_l2_hybrid": float(history["l2_hybrid"][-1]),
     }
 
     if debug_sign_metrics:
-        result['sign_metrics'] = {
-            'one_step': _summarize_sign_buffers(one_pred_buf, one_true_buf, one_shock_buf),
-            'train_semantic': _summarize_sign_buffers(train_pred_buf, train_true_buf, train_shock_buf),
+        result["sign_metrics"] = {
+            "one_step": _summarize_sign_buffers(one_pred_buf, one_true_buf, one_shock_buf),
         }
 
     if debug_gate_metrics:
@@ -547,26 +582,27 @@ def _run_rollout_once(
         shock_sensor = np.concatenate(shock_sensor_buf) if shock_sensor_buf else np.array([], dtype=np.float64)
         corr_before_gate = np.concatenate(corr_before_gate_buf) if corr_before_gate_buf else np.array([], dtype=np.float64)
         corr_after_gate = np.concatenate(corr_after_gate_buf) if corr_after_gate_buf else np.array([], dtype=np.float64)
+        applied_corr = np.concatenate(applied_corr_buf) if applied_corr_buf else np.array([], dtype=np.float64)
 
-        result['gate_metrics'] = {
-            'raw_gate_min': float(np.min(gate_raw)),
-            'raw_gate_mean': float(np.mean(gate_raw)),
-            'raw_gate_max': float(np.max(gate_raw)),
-            'effective_gate_min': float(np.min(gate_eff)),
-            'effective_gate_mean': float(np.mean(gate_eff)),
-            'effective_gate_max': float(np.max(gate_eff)),
-            'mask_active_ratio': float(np.mean(gate_mask)),
-            'shock_indicator_min': float(np.min(shock_sensor)),
-            'shock_indicator_mean': float(np.mean(shock_sensor)),
-            'shock_indicator_max': float(np.max(shock_sensor)),
-            'corr_before_gate_abs_mean': float(np.mean(np.abs(corr_before_gate))),
-            'corr_before_gate_abs_max': float(np.max(np.abs(corr_before_gate))),
-            'corr_after_gate_abs_mean': float(np.mean(np.abs(corr_after_gate))),
-            'corr_after_gate_abs_max': float(np.max(np.abs(corr_after_gate))),
-            'applied_corr_abs_mean': float(np.mean(np.abs(history['corr_abs_mean']))),
-            'applied_corr_abs_max': float(np.max(np.abs(history['corr_abs_mean']))),
-            'corr_to_baseline_ratio_mean': float(np.mean(history['corr_to_baseline_ratio'])),
-            'corr_to_baseline_ratio_max': float(np.max(history['corr_to_baseline_ratio'])),
+        result["gate_metrics"] = {
+            "raw_gate_min": float(np.min(gate_raw)),
+            "raw_gate_mean": float(np.mean(gate_raw)),
+            "raw_gate_max": float(np.max(gate_raw)),
+            "effective_gate_min": float(np.min(gate_eff)),
+            "effective_gate_mean": float(np.mean(gate_eff)),
+            "effective_gate_max": float(np.max(gate_eff)),
+            "mask_active_ratio": float(np.mean(gate_mask)),
+            "shock_indicator_min": float(np.min(shock_sensor)),
+            "shock_indicator_mean": float(np.mean(shock_sensor)),
+            "shock_indicator_max": float(np.max(shock_sensor)),
+            "corr_before_gate_abs_mean": float(np.mean(np.abs(corr_before_gate))),
+            "corr_before_gate_abs_max": float(np.max(np.abs(corr_before_gate))),
+            "corr_after_gate_abs_mean": float(np.mean(np.abs(corr_after_gate))),
+            "corr_after_gate_abs_max": float(np.max(np.abs(corr_after_gate))),
+            "applied_corr_abs_mean": float(np.mean(np.abs(applied_corr))),
+            "applied_corr_abs_max": float(np.max(np.abs(applied_corr))),
+            "corr_to_baseline_ratio_mean": float(np.mean(history["corr_to_baseline_ratio"])),
+            "corr_to_baseline_ratio_max": float(np.max(history["corr_to_baseline_ratio"])),
         }
 
     return result
@@ -581,23 +617,26 @@ def _print_sign_metrics(label, metrics):
     print(
         f"{label} global: count={g['count']} "
         f"mean(pred*true)={g['mean_prod']:.3e}, cosine={g['cosine_similarity']:.3f}, "
-        f"sign_ratio={g['sign_agreement_ratio']:.3f}, corr={g['correlation_coeff']:.3f}"
+        f"sign_ratio={g['sign_agreement_ratio']:.3f}, corr={g['correlation_coeff']:.3f}, "
+        f"|pred|(mean/max)=({g['pred_abs_mean']:.3e}/{g['pred_abs_max']:.3e}), "
+        f"|true|(mean/max)=({g['true_abs_mean']:.3e}/{g['true_abs_max']:.3e})"
     )
     print(
         f"{label} shock : count={s['count']} "
         f"mean(pred*true)={s['mean_prod']:.3e}, cosine={s['cosine_similarity']:.3f}, "
-        f"sign_ratio={s['sign_agreement_ratio']:.3f}, corr={s['correlation_coeff']:.3f}"
+        f"sign_ratio={s['sign_agreement_ratio']:.3f}, corr={s['correlation_coeff']:.3f}, "
+        f"|pred|(mean/max)=({s['pred_abs_mean']:.3e}/{s['pred_abs_max']:.3e}), "
+        f"|true|(mean/max)=({s['true_abs_mean']:.3e}/{s['true_abs_max']:.3e})"
     )
 
 
 def run_evaluation(cfg=None, **legacy_kwargs):
-    # 新接口：run_evaluation(cfg)；旧接口：run_evaluation(model_path='...')
     if isinstance(cfg, dict):
         run_cfg = cfg
     else:
         run_cfg = load_config(None)
         if cfg is not None:
-            legacy_kwargs.setdefault('model_path', cfg)
+            legacy_kwargs.setdefault("model_path", cfg)
 
     run_cfg = _apply_legacy_overrides(run_cfg, legacy_kwargs)
     runtime_cfg = run_cfg.get("runtime", {})
@@ -607,36 +646,41 @@ def run_evaluation(cfg=None, **legacy_kwargs):
     log_cfg = run_cfg.get("logging", {})
     plot_cfg = run_cfg.get("plotting", {})
     solver_cfg = run_cfg.get("solver", {})
+    metadata_cfg = run_cfg.get("metadata", {})
+
+    cfg_steps_ahead = int(cfg_get(run_cfg, "data_generation.steps_ahead", 1))
+    if cfg_steps_ahead != 1:
+        raise ValueError(
+            "Evaluation config must use strict one-step correction: "
+            f"data_generation.steps_ahead={cfg_steps_ahead}."
+        )
 
     set_global_seed(runtime_cfg.get("seed", None), bool(runtime_cfg.get("deterministic", False)))
 
     device = _resolve_device(runtime_cfg)
     model_path = Path(path_cfg.get("model_save_path", "kan_model.pth"))
 
-    try:
-        predictor = KANPredictor(
-            model_path=str(model_path),
-            device=device,
-            model_cfg=run_cfg.get("model", {}),
-            scaler_cfg=run_cfg.get("scaler", {}),
-            gate_mode=str(ab_cfg.get("gate_mode", "soft_mask")),
-            hard_gate_sensor_threshold=float(ab_cfg.get("hard_gate_sensor_threshold", 0.1)),
-            soft_mask_center=float(ab_cfg.get("soft_mask_center", 0.1)),
-            soft_mask_width=float(ab_cfg.get("soft_mask_width", 0.08)),
-            soft_mask_floor=float(ab_cfg.get("soft_mask_floor", 0.02)),
-            correction_clip_abs=ab_cfg.get("correction_clip_abs", None),
-            debug_rollout=bool(log_cfg.get("debug_rollout", False)),
-            debug_t_start=float(log_cfg.get("debug_t_start", 1.0)),
-        )
-    except Exception:
-        print("Model not found. Run training first.")
-        return
+    predictor = KANPredictor(
+        model_path=str(model_path),
+        device=device,
+        model_cfg=run_cfg.get("model", {}),
+        scaler_cfg=run_cfg.get("scaler", {}),
+        gate_mode=str(ab_cfg.get("gate_mode", "train_equivalent")),
+        hard_gate_sensor_threshold=float(ab_cfg.get("hard_gate_sensor_threshold", 0.1)),
+        soft_mask_center=float(ab_cfg.get("soft_mask_center", 0.1)),
+        soft_mask_width=float(ab_cfg.get("soft_mask_width", 0.08)),
+        soft_mask_floor=float(ab_cfg.get("soft_mask_floor", 0.02)),
+        correction_clip_abs=ab_cfg.get("correction_clip_abs", None),
+        debug_rollout=bool(log_cfg.get("debug_rollout", False)),
+        debug_t_start=float(log_cfg.get("debug_t_start", 1.0)),
+        metadata_cfg=metadata_cfg,
+    )
 
     N_coarse = int(eval_cfg.get("N_coarse", 128))
     N_ref = int(eval_cfg.get("N_ref", 2048))
     T_final = float(eval_cfg.get("T_final", 1.5))
     cfl = float(eval_cfg.get("cfl", 0.4))
-    remove_correction_mean = bool(eval_cfg.get("remove_correction_mean", True))
+    remove_correction_mean = bool(eval_cfg.get("remove_correction_mean", False))
     ic_cfg = eval_cfg.get("initial_condition", {})
     nu = float(solver_cfg.get("nu", 0.0))
     weno_epsilon = float(solver_cfg.get("weno_epsilon", 1e-6))
@@ -650,6 +694,9 @@ def run_evaluation(cfg=None, **legacy_kwargs):
     print(
         "Starting Rollout Evaluation... "
         f"correction_sign_mode={correction_sign_mode}, "
+        f"default_sign={predictor.default_correction_sign}, "
+        f"gate_mode={predictor.gate_mode}, "
+        f"remove_correction_mean={remove_correction_mean}, "
         f"debug_sign_metrics={debug_sign_metrics}, "
         f"debug_gate_metrics={debug_gate_metrics}"
     )
@@ -670,7 +717,7 @@ def run_evaluation(cfg=None, **legacy_kwargs):
         debug_sign_metrics=debug_sign_metrics,
         debug_gate_metrics=debug_gate_metrics,
     )
-    history = main_result['history']
+    history = main_result["history"]
 
     print(
         "Rollout summary: "
@@ -681,15 +728,12 @@ def run_evaluation(cfg=None, **legacy_kwargs):
     )
 
     if debug_sign_metrics:
-        print("Sign diagnostics (pred_corr vs true_corr):")
-        _print_sign_metrics("one-step", main_result['sign_metrics']['one_step'])
-        _print_sign_metrics("train-semantic", main_result['sign_metrics']['train_semantic'])
+        print("Sign diagnostics (pred_corr vs one-step true_corr):")
+        _print_sign_metrics("one-step", main_result["sign_metrics"]["one_step"])
 
         plus_minus_results = {}
         for mode in ("plus", "minus"):
-            if mode == main_result['resolved_sign_mode'] or (
-                mode == "plus" and main_result['resolved_sign_mode'] == "auto"
-            ):
+            if mode == main_result["resolved_sign_mode"]:
                 plus_minus_results[mode] = main_result
             else:
                 plus_minus_results[mode] = _run_rollout_once(
@@ -718,7 +762,7 @@ def run_evaluation(cfg=None, **legacy_kwargs):
             )
 
     if debug_gate_metrics and 'gate_metrics' in main_result:
-        g = main_result['gate_metrics']
+        g = main_result["gate_metrics"]
         print(
             "Gate diagnostics summary: "
             f"raw_gate(mean/min/max)=({g['raw_gate_mean']:.3f}/{g['raw_gate_min']:.3f}/{g['raw_gate_max']:.3f}), "
@@ -727,12 +771,13 @@ def run_evaluation(cfg=None, **legacy_kwargs):
             f"shock(mean/min/max)=({g['shock_indicator_mean']:.3f}/{g['shock_indicator_min']:.3f}/{g['shock_indicator_max']:.3f}), "
             f"corr_before_gate_abs(mean/max)=({g['corr_before_gate_abs_mean']:.3e}/{g['corr_before_gate_abs_max']:.3e}), "
             f"corr_after_gate_abs(mean/max)=({g['corr_after_gate_abs_mean']:.3e}/{g['corr_after_gate_abs_max']:.3e}), "
+            f"applied_corr_abs(mean/max)=({g['applied_corr_abs_mean']:.3e}/{g['applied_corr_abs_max']:.3e}), "
             f"corr/base(mean/max)=({g['corr_to_baseline_ratio_mean']:.3e}/{g['corr_to_baseline_ratio_max']:.3e})"
         )
 
     if not bool(plot_cfg.get("enabled", True)):
         print("Evaluation complete. Plotting disabled by config.")
-        return
+        return main_result
 
     try:
         fig_size = plot_cfg.get("figsize", [10, 8])
@@ -775,6 +820,8 @@ def run_evaluation(cfg=None, **legacy_kwargs):
     except Exception as e:
         print(f"Plotting failed (expected in some CI environments): {e}")
         print("Evaluation numeric data collected successfully.")
+
+    return main_result
 
 
 def _parse_args():

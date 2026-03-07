@@ -3,10 +3,16 @@ import time
 from pathlib import Path
 
 import numpy as np
-from numpy.lib.stride_tricks import sliding_window_view
 
 from solvers.weno import rk3_step
 from utils.config import load_config, set_global_seed
+from utils.features import (
+    CANONICAL_PHYSICS_FEATURE_NAMES,
+    build_model_inputs,
+    downsample_periodic,
+    require_integer_refinement,
+)
+from utils.metadata import build_dataset_metadata, serialize_metadata
 
 
 def generate_random_state(
@@ -16,7 +22,7 @@ def generate_random_state(
     amplitude_max=1.0,
     amplitude_decay_power=1.0,
 ):
-    """Generate random wave with high-frequency components."""
+    """Generate a random periodic waveform with controllable high-frequency content."""
     x = np.linspace(0, 2 * np.pi, N, endpoint=False)
     u = np.zeros_like(x)
     for k in range(1, num_modes + 1):
@@ -27,50 +33,49 @@ def generate_random_state(
     return u
 
 
-def get_multistep_error(u_coarse_init, N_coarse, N_fine, dt, steps, nu=0.0, weno_epsilon=1e-6):
-    """Calculate accumulated error over 'steps'."""
-    u_fine = np.interp(
-        np.linspace(0, 2 * np.pi, N_fine, endpoint=False),
-        np.linspace(0, 2 * np.pi, N_coarse, endpoint=False),
-        u_coarse_init,
+def build_paired_initial_state(
+    N_coarse,
+    N_fine,
+    *,
+    num_modes=6,
+    amplitude_min=0.1,
+    amplitude_max=1.0,
+    amplitude_decay_power=1.0,
+):
+    """Build a fine/coarse pair from the same underlying reference state."""
+    ratio = require_integer_refinement(N_fine, N_coarse)
+    u_ref = generate_random_state(
+        N_fine,
+        num_modes=num_modes,
+        amplitude_min=amplitude_min,
+        amplitude_max=amplitude_max,
+        amplitude_decay_power=amplitude_decay_power,
     )
-
-    substeps_ratio = N_fine // N_coarse
-    dt_fine = dt / substeps_ratio
-
-    for _ in range(steps * substeps_ratio):
-        u_fine = rk3_step(u_fine, 2 * np.pi / N_fine, dt_fine, nu=nu, weno_epsilon=weno_epsilon)
-
-    u_truth_down = u_fine[::substeps_ratio]
-    u_weno = u_coarse_init.copy()
-    dx_coarse = 2 * np.pi / N_coarse
-
-    for _ in range(steps):
-        u_weno = rk3_step(u_weno, dx_coarse, dt, nu=nu, weno_epsilon=weno_epsilon)
-
-    return u_truth_down - u_weno
+    u_coarse = downsample_periodic(u_ref, ratio=ratio)
+    return u_ref, u_coarse
 
 
-def compute_physics_features(u, dx, dt, t_stamp):
-    """Physics features: [u_x, |u_x|, |u_xx|, grad_var, dt, sin(t), cos(t)]."""
-    u_x = np.gradient(u, dx)
-    abs_ux = np.abs(u_x)
-    u_xx = np.gradient(u_x, dx)
-    abs_uxx = np.abs(u_xx)
-    grad_var = np.sqrt(((np.roll(u_x, -1) - u_x) ** 2 + (np.roll(u_x, 1) - u_x) ** 2) * 0.5)
-    dt_feat = np.full_like(u_x, dt)
-    t_sin = np.full_like(u_x, np.sin(t_stamp))
-    t_cos = np.full_like(u_x, np.cos(t_stamp))
-    return np.stack([u_x, abs_ux, abs_uxx, grad_var, dt_feat, t_sin, t_cos], axis=1)
+def get_one_step_pair(
+    u_ref_current,
+    u_coarse_current,
+    *,
+    dx_ref,
+    dx_coarse,
+    dt,
+    substeps_ratio,
+    nu=0.0,
+    weno_epsilon=1e-6,
+):
+    """严格 one-step 目标: target = downsample(u_ref_next) - u_weno_next。"""
+    u_ref_next = u_ref_current.copy()
+    dt_ref = dt / substeps_ratio
+    for _ in range(substeps_ratio):
+        u_ref_next = rk3_step(u_ref_next, dx_ref, dt_ref, nu=nu, weno_epsilon=weno_epsilon)
 
-
-def build_sample(u_n, dx_coarse, dt, t_stamp, stencil_size):
-    """Build one full-grid training sample block from the current PDE state."""
-    pad_size = stencil_size // 2
-    phys_feats = compute_physics_features(u_n, dx_coarse, dt, t_stamp)
-    u_padded = np.pad(u_n, (pad_size, pad_size), mode="wrap")
-    stencils = sliding_window_view(u_padded, window_shape=stencil_size)
-    return np.hstack([stencils, phys_feats])
+    u_weno_next = rk3_step(u_coarse_current, dx_coarse, dt, nu=nu, weno_epsilon=weno_epsilon)
+    u_ref_next_down = downsample_periodic(u_ref_next, ratio=substeps_ratio)
+    target = u_ref_next_down - u_weno_next
+    return u_ref_next, u_weno_next, target
 
 
 def rollout_session(
@@ -90,64 +95,106 @@ def rollout_session(
     warmup_factor=4,
     max_rollout_factor=3,
 ):
-    """Run one trajectory session and collect multiple supervised samples."""
+    """Run a paired fine/coarse trajectory and collect one-step correction targets."""
+    if int(steps_ahead) != 1:
+        raise ValueError(
+            "Strict one-step correction is now the primary data path; "
+            f"got steps_ahead={steps_ahead}. Regenerate data with steps_ahead=1."
+        )
+
+    substeps_ratio = require_integer_refinement(N_fine, N_coarse)
     dx_coarse = 2 * np.pi / N_coarse
-    u_n = generate_random_state(
+    dx_ref = 2 * np.pi / N_fine
+    phys_dim = len(CANONICAL_PHYSICS_FEATURE_NAMES)
+
+    u_ref, u_coarse = build_paired_initial_state(
         N_coarse,
+        N_fine,
         num_modes=num_modes,
         amplitude_min=amplitude_min,
         amplitude_max=amplitude_max,
         amplitude_decay_power=amplitude_decay_power,
     )
-    dt = cfl * dx_coarse / (np.max(np.abs(u_n)) + 1e-6)
 
-    warmup_steps = np.random.randint(0, steps_ahead * warmup_factor + 1)
+    dt = cfl * dx_coarse / (np.max(np.abs(u_coarse)) + 1e-6)
+    warmup_steps = np.random.randint(0, max(steps_ahead, 1) * warmup_factor + 1)
     t_stamp = 0.0
     for _ in range(warmup_steps):
-        u_n = rk3_step(u_n, dx_coarse, dt, nu=nu, weno_epsilon=weno_epsilon)
+        u_ref, u_coarse, _ = get_one_step_pair(
+            u_ref,
+            u_coarse,
+            dx_ref=dx_ref,
+            dx_coarse=dx_coarse,
+            dt=dt,
+            substeps_ratio=substeps_ratio,
+            nu=nu,
+            weno_epsilon=weno_epsilon,
+        )
         t_stamp += dt
-        dt = cfl * dx_coarse / (np.max(np.abs(u_n)) + 1e-6)
+        dt = cfl * dx_coarse / (np.max(np.abs(u_coarse)) + 1e-6)
 
     X_blocks = []
     y_blocks = []
     stride_count = 0
-
     max_rollout_steps = max(samples_per_session * sample_stride * max_rollout_factor, samples_per_session + 1)
+
     for _ in range(max_rollout_steps):
-        if stride_count % sample_stride == 0:
-            err = get_multistep_error(
-                u_n,
-                N_coarse,
-                N_fine,
-                dt,
-                steps_ahead,
-                nu=nu,
-                weno_epsilon=weno_epsilon,
-            )
-            X_blocks.append(build_sample(u_n, dx_coarse, dt, t_stamp, stencil_size))
-            y_blocks.append(err)
-            if len(X_blocks) >= samples_per_session:
-                break
-
-        u_n = rk3_step(u_n, dx_coarse, dt, nu=nu, weno_epsilon=weno_epsilon)
-        t_stamp += dt
-        dt = cfl * dx_coarse / (np.max(np.abs(u_n)) + 1e-6)
-        stride_count += 1
-
-    if not X_blocks:
-        err = get_multistep_error(
-            u_n,
-            N_coarse,
-            N_fine,
-            dt,
-            steps_ahead,
+        u_ref_next, u_weno_next, target = get_one_step_pair(
+            u_ref,
+            u_coarse,
+            dx_ref=dx_ref,
+            dx_coarse=dx_coarse,
+            dt=dt,
+            substeps_ratio=substeps_ratio,
             nu=nu,
             weno_epsilon=weno_epsilon,
         )
-        X_blocks.append(build_sample(u_n, dx_coarse, dt, t_stamp, stencil_size))
-        y_blocks.append(err)
 
-    return np.vstack(X_blocks), np.concatenate(y_blocks).reshape(-1, 1)
+        if stride_count % sample_stride == 0:
+            X_blocks.append(
+                build_model_inputs(
+                    u_coarse,
+                    stencil_size=stencil_size,
+                    dx=dx_coarse,
+                    dt=dt,
+                    t_stamp=t_stamp,
+                    phys_dim=phys_dim,
+                )
+            )
+            y_blocks.append(target.reshape(-1, 1))
+            if len(X_blocks) >= samples_per_session:
+                break
+
+        u_ref = u_ref_next
+        u_coarse = u_weno_next
+        t_stamp += dt
+        dt = cfl * dx_coarse / (np.max(np.abs(u_coarse)) + 1e-6)
+        stride_count += 1
+
+    if not X_blocks:
+        _, _, target = get_one_step_pair(
+            u_ref,
+            u_coarse,
+            dx_ref=dx_ref,
+            dx_coarse=dx_coarse,
+            dt=dt,
+            substeps_ratio=substeps_ratio,
+            nu=nu,
+            weno_epsilon=weno_epsilon,
+        )
+        X_blocks.append(
+            build_model_inputs(
+                u_coarse,
+                stencil_size=stencil_size,
+                dx=dx_coarse,
+                dt=dt,
+                t_stamp=t_stamp,
+                phys_dim=phys_dim,
+            )
+        )
+        y_blocks.append(target.reshape(-1, 1))
+
+    return np.vstack(X_blocks), np.vstack(y_blocks), phys_dim
 
 
 def _format_seconds(seconds):
@@ -164,7 +211,7 @@ def generate_dataset(
     num_samples=5000,
     N_coarse=128,
     N_fine=2048,
-    steps_ahead=10,
+    steps_ahead=1,
     stencil_size=9,
     cfl=0.5,
     num_sessions=64,
@@ -181,7 +228,14 @@ def generate_dataset(
     max_rollout_factor=3,
     progress_bar_width=30,
 ):
-    print(f"Generating Dataset: {num_samples} samples, Lookahead={steps_ahead} steps...")
+    if int(steps_ahead) != 1:
+        raise ValueError(
+            "Strict one-step correction is now required for generated datasets; "
+            f"got steps_ahead={steps_ahead}."
+        )
+
+    require_integer_refinement(N_fine, N_coarse)
+    print(f"Generating one-step dataset: {num_samples} samples, steps_ahead={steps_ahead}")
     print(f"Multi-session mode: sessions={num_sessions}, sample_stride={sample_stride}")
 
     if seed is not None:
@@ -194,6 +248,7 @@ def generate_dataset(
     target_points = num_samples * N_coarse
     sessions_done = 0
     start_time = time.time()
+    phys_dim = len(CANONICAL_PHYSICS_FEATURE_NAMES)
 
     def print_progress(force=False):
         progress = min(total_points / max(target_points, 1), 1.0)
@@ -220,7 +275,7 @@ def generate_dataset(
         sessions_left = max(num_sessions - sessions_done + 1, 1)
         samples_this_session = max(1, int(np.ceil(remaining_samples / sessions_left)))
 
-        X_session, y_session = rollout_session(
+        X_session, y_session, phys_dim = rollout_session(
             N_coarse=N_coarse,
             N_fine=N_fine,
             steps_ahead=steps_ahead,
@@ -243,21 +298,41 @@ def generate_dataset(
         total_points += X_session.shape[0]
         print_progress(force=False)
 
-    X_data = np.vstack(X_list)
-    y_data = np.vstack(y_list)
-
-    X_data = X_data[:target_points]
-    y_data = y_data[:target_points]
+    X_data = np.vstack(X_list)[:target_points].astype(np.float32)
+    y_data = np.vstack(y_list)[:target_points].astype(np.float32)
     total_points = X_data.shape[0]
     print_progress(force=True)
 
+    metadata = build_dataset_metadata(
+        steps_ahead=steps_ahead,
+        stencil_size=stencil_size,
+        phys_dim=phys_dim,
+        physics_feature_names=list(CANONICAL_PHYSICS_FEATURE_NAMES),
+        solver_cfg={"nu": nu, "weno_epsilon": weno_epsilon},
+        generation_cfg={
+            "N_coarse": N_coarse,
+            "N_fine": N_fine,
+            "cfl": cfl,
+            "sample_stride": sample_stride,
+            "num_sessions": num_sessions,
+        },
+    )
+
     output_path = Path(output_path)
-    np.savez(str(output_path), X=X_data, y=y_data, steps_ahead=steps_ahead, stencil_size=stencil_size)
+    np.savez(
+        str(output_path),
+        X=X_data,
+        y=y_data,
+        steps_ahead=np.int64(steps_ahead),
+        stencil_size=np.int64(stencil_size),
+        phys_dim=np.int64(phys_dim),
+        metadata_json=np.array(serialize_metadata(metadata)),
+    )
     print(f"Dataset saved to '{output_path}'. Shape: {X_data.shape}")
 
 
 def _parse_args():
-    parser = argparse.ArgumentParser(description="Generate KAN training data in multi-session mode.")
+    parser = argparse.ArgumentParser(description="Generate one-step KAN training data in multi-session mode.")
     parser.add_argument("--config", type=str, default=None, help="配置文件路径（可选）")
 
     # 兼容旧参数：仅在显式传入时覆盖配置值
@@ -304,7 +379,7 @@ if __name__ == "__main__":
         num_samples=int(gen_cfg.get("num_samples", 5000)),
         N_coarse=int(gen_cfg.get("N_coarse", 128)),
         N_fine=int(gen_cfg.get("N_fine", 2048)),
-        steps_ahead=int(gen_cfg.get("steps_ahead", 10)),
+        steps_ahead=int(gen_cfg.get("steps_ahead", 1)),
         stencil_size=int(gen_cfg.get("stencil_size", 9)),
         cfl=float(gen_cfg.get("cfl", 0.5)),
         num_sessions=int(gen_cfg.get("num_sessions", 64)),

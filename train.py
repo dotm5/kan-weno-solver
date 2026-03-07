@@ -1,5 +1,6 @@
 import argparse
 import gc
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -9,51 +10,15 @@ import torch.optim as optim
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
 
-from kan import GatedKAN, HybridScaler
+from kan import GatedKAN, HybridScaler, TargetAffineScaler
 from utils.config import cfg_get, load_config, set_global_seed
-
-
-class TargetAffineScaler:
-    """Affine target scaler with std floor and z-score clipping for stability."""
-
-    def __init__(self, eps=1e-12, min_std=1e-8, clip_z=8.0):
-        self.eps = eps
-        self.min_std = min_std
-        self.clip_z = clip_z
-        self.mean = 0.0
-        self.std = 1.0
-
-    def fit(self, y):
-        self.mean = float(np.mean(y))
-        raw_std = float(np.std(y))
-        self.std = max(raw_std, self.min_std)
-        if raw_std < self.min_std:
-            print(f"Warning: target std={raw_std:.3e} < min_std={self.min_std:.3e}, using std floor.")
-        return self
-
-    def transform(self, y):
-        z = (y - self.mean) / max(self.std, self.eps)
-        if self.clip_z is not None:
-            z = np.clip(z, -self.clip_z, self.clip_z)
-        return z
-
-    def inverse_transform(self, y):
-        return y * self.std + self.mean
-
-    def state_dict(self):
-        return {
-            "mean": self.mean,
-            "std": self.std,
-            "min_std": self.min_std,
-            "clip_z": self.clip_z,
-        }
-
-    def load_state_dict(self, state):
-        self.mean = float(state.get("mean", 0.0))
-        std = float(state.get("std", 1.0))
-        self.std = max(std, self.min_std)
-        self.min_std = float(state.get("min_std", self.min_std))
-        self.clip_z = state.get("clip_z", self.clip_z)
+from utils.features import FEATURE_LAYOUT_VERSION, physics_feature_names
+from utils.metadata import (
+    build_checkpoint_metadata,
+    default_target_scaling_metadata,
+    extract_dataset_metadata,
+    validate_one_step_metadata,
+)
 
 
 class PDEDataset(Dataset):
@@ -101,6 +66,47 @@ def _resolve_auto_flag(value, auto_default):
     return bool(value)
 
 
+def _prepare_dataset_metadata(data, *, data_path: Path, stencil_size: int, inferred_phys_dim: int, cfg):
+    warn_on_missing = bool(cfg_get(cfg, "metadata.warn_on_missing", True))
+    strict_metadata = bool(cfg_get(cfg, "metadata.strict", True))
+    cfg_steps_ahead = int(cfg_get(cfg, "data_generation.steps_ahead", 1))
+    if cfg_steps_ahead != 1:
+        raise ValueError(
+            "Training config must use strict one-step correction: "
+            f"data_generation.steps_ahead={cfg_steps_ahead}."
+        )
+
+    dataset_metadata = extract_dataset_metadata(
+        data,
+        source_label=str(data_path),
+        warn_on_missing=warn_on_missing,
+    )
+    dataset_metadata.setdefault("steps_ahead", int(data["steps_ahead"]) if "steps_ahead" in data.files else 1)
+    dataset_metadata.setdefault("stencil_size", stencil_size)
+    dataset_metadata.setdefault("phys_dim", inferred_phys_dim)
+    dataset_metadata.setdefault("physics_feature_names", physics_feature_names(inferred_phys_dim))
+    dataset_metadata.setdefault("feature_layout_version", FEATURE_LAYOUT_VERSION)
+
+    try:
+        validate_one_step_metadata(
+            dataset_metadata,
+            source_label=str(data_path),
+            expected_steps_ahead=cfg_steps_ahead,
+            expected_stencil_size=stencil_size,
+            expected_phys_dim=inferred_phys_dim,
+            expected_feature_names=physics_feature_names(inferred_phys_dim),
+        )
+    except ValueError:
+        if strict_metadata:
+            raise
+        warnings.warn(
+            f"{data_path}: metadata validation failed, continuing because metadata.strict=false.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return dataset_metadata
+
+
 def train_with_config(cfg):
     runtime_cfg = cfg.get("runtime", {})
     path_cfg = cfg.get("paths", {})
@@ -110,8 +116,10 @@ def train_with_config(cfg):
     sched_cfg = cfg.get("scheduler", {})
     loss_cfg = cfg.get("loss", {})
     model_cfg = cfg.get("model", {})
+    solver_cfg = cfg.get("solver", {})
     scaler_cfg = cfg.get("scaler", {})
     target_scaler_cfg = cfg.get("target_scaler", {})
+    strict_metadata = bool(cfg_get(cfg, "metadata.strict", True))
 
     set_global_seed(runtime_cfg.get("seed", None), bool(runtime_cfg.get("deterministic", False)))
 
@@ -122,15 +130,27 @@ def train_with_config(cfg):
     if not data_path.exists():
         raise FileNotFoundError(f"Training data file not found: {data_path}")
 
-    # 1) Load data
-    data = np.load(str(data_path))
-    X = data['X'].astype(np.float32)
-    y = data['y'].astype(np.float32)
-    stencil_size = int(data['stencil_size'])
-    steps_ahead = int(data['steps_ahead'])
-    phys_dim = int(X.shape[1] - stencil_size)
+    # 严格 one-step 语义：训练数据必须直接存储 next-step correction target。
+    data = np.load(str(data_path), allow_pickle=False)
+    X = data["X"].astype(np.float32)
+    y = data["y"].astype(np.float32)
+    stencil_size = int(data["stencil_size"])
+    inferred_phys_dim = int(X.shape[1] - stencil_size)
+    dataset_metadata = _prepare_dataset_metadata(
+        data,
+        data_path=data_path,
+        stencil_size=stencil_size,
+        inferred_phys_dim=inferred_phys_dim,
+        cfg=cfg,
+    )
+    phys_dim = int(dataset_metadata.get("phys_dim", inferred_phys_dim))
+    print(
+        "Dataset metadata: "
+        f"steps_ahead={dataset_metadata.get('steps_ahead')}, "
+        f"phys_dim={phys_dim}, "
+        f"feature_layout={dataset_metadata.get('feature_layout_version')}"
+    )
 
-    # 2) Split + scale inputs/targets
     X_train_raw, X_val_raw, y_train_raw, y_val_raw = train_test_split(
         X,
         y,
@@ -149,13 +169,16 @@ def train_with_config(cfg):
     target_scaler = TargetAffineScaler(
         eps=float(target_scaler_cfg.get("eps", 1e-12)),
         min_std=float(target_scaler_cfg.get("min_std", 1e-8)),
-        clip_z=float(target_scaler_cfg.get("clip_z", 8.0)) if target_scaler_cfg.get("clip_z", 8.0) is not None else None,
+        clip_z=target_scaler_cfg.get("clip_z", None),
     ).fit(y_train_raw)
 
     y_train = target_scaler.transform(y_train_raw).astype(np.float32)
     y_val = target_scaler.transform(y_val_raw).astype(np.float32)
 
-    print(f"Target affine scaling: mean={target_scaler.mean:.3e}, std={target_scaler.std:.3e}, clip_z={target_scaler.clip_z}")
+    print(
+        "Target affine scaling: "
+        f"mean={target_scaler.mean:.3e}, std={target_scaler.std:.3e}, clip_z={target_scaler.clip_z}"
+    )
 
     pin_memory = _resolve_auto_flag(runtime_cfg.get("pin_memory", "auto"), device.type == "cuda")
     num_workers = int(runtime_cfg.get("num_workers", 0))
@@ -175,7 +198,6 @@ def train_with_config(cfg):
         num_workers=num_workers,
     )
 
-    # 3) Model + optimizer
     model = GatedKAN(
         stencil_size=stencil_size,
         phys_dim=phys_dim,
@@ -210,13 +232,13 @@ def train_with_config(cfg):
     )
 
     use_amp = _resolve_auto_flag(runtime_cfg.get("use_amp", "auto"), device.type == "cuda")
-    grad_scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+    autocast_device = "cuda" if device.type == "cuda" else "cpu"
+    grad_scaler = torch.amp.GradScaler("cuda", enabled=use_amp and device.type == "cuda")
     shock_feature_idx = stencil_size + (1 if phys_dim > 1 else 0)
 
     target_mean_t = torch.tensor(target_scaler.mean, dtype=torch.float32, device=device)
     target_std_t = torch.tensor(target_scaler.std, dtype=torch.float32, device=device)
 
-    # 损失相关超参数（从配置读取）
     smooth_l1_beta = float(loss_cfg.get("smooth_l1_beta", 1.0))
     smooth_threshold = float(loss_cfg.get("gate_smooth_threshold", 0.1))
     separation_margin = float(loss_cfg.get("gate_separation_margin", 0.05))
@@ -233,7 +255,6 @@ def train_with_config(cfg):
     log_every = int(train_cfg.get("log_every", 20))
     epochs = int(train_cfg.get("epochs", 100))
 
-    # 4) Training loop
     for epoch in range(epochs):
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -247,7 +268,7 @@ def train_with_config(cfg):
             batch_y = batch_y.to(device, non_blocking=True)
             shock_metric = batch_X[:, shock_feature_idx]
 
-            with torch.amp.autocast(device_type='cuda', enabled=use_amp):
+            with torch.amp.autocast(device_type=autocast_device, enabled=use_amp and device.type == "cuda"):
                 pred_z, gate = model(batch_X)
 
                 pred_loss = F.smooth_l1_loss(pred_z, batch_y, beta=smooth_l1_beta)
@@ -264,7 +285,10 @@ def train_with_config(cfg):
                     + gate_shock_open_w * shock_open_core
                 )
 
-                gate_reg_scale = torch.clamp(pred_loss.detach(), min=gate_reg_scale_min, max=gate_reg_scale_max) * gate_reg_scale_factor
+                gate_reg_scale = (
+                    torch.clamp(pred_loss.detach(), min=gate_reg_scale_min, max=gate_reg_scale_max)
+                    * gate_reg_scale_factor
+                )
                 loss = (pred_loss + gate_reg_scale * gate_reg) / accumulation_steps
 
             grad_scaler.scale(loss).backward()
@@ -280,16 +304,33 @@ def train_with_config(cfg):
             train_pred_sum += pred_loss.item()
             train_gate_sep_sum += (gate_shock - gate_smooth).item()
 
-            del batch_X, batch_y, shock_metric, pred_z, gate, pred_loss, gate_smooth, gate_shock, sparsity_core, separation_core, shock_open_core, gate_reg, gate_reg_scale, loss
+            del (
+                batch_X,
+                batch_y,
+                shock_metric,
+                pred_z,
+                gate,
+                pred_loss,
+                gate_smooth,
+                gate_shock,
+                sparsity_core,
+                separation_core,
+                shock_open_core,
+                gate_reg,
+                gate_reg_scale,
+                loss,
+            )
 
-        # 5) Validation
         model.eval()
         val_pred_sum = 0.0
         val_phys_wmse_sum = 0.0
         val_gate_sep_sum = 0.0
         batch_count = 0
 
-        with torch.no_grad(), torch.amp.autocast(device_type='cuda', enabled=use_amp):
+        with torch.no_grad(), torch.amp.autocast(
+            device_type=autocast_device,
+            enabled=use_amp and device.type == "cuda",
+        ):
             for batch_X, batch_y in val_loader:
                 batch_X = batch_X.to(device, non_blocking=True)
                 batch_y = batch_y.to(device, non_blocking=True)
@@ -314,7 +355,20 @@ def train_with_config(cfg):
                 val_gate_sep_sum += (gate_shock - gate_smooth).item() * batch_X.size(0)
                 batch_count += batch_X.size(0)
 
-                del batch_X, batch_y, shock_metric, pred_z, gate, pred_loss, pred_phys, target_phys, weights, wmse_phys, gate_smooth, gate_shock
+                del (
+                    batch_X,
+                    batch_y,
+                    shock_metric,
+                    pred_z,
+                    gate,
+                    pred_loss,
+                    pred_phys,
+                    target_phys,
+                    weights,
+                    wmse_phys,
+                    gate_smooth,
+                    gate_shock,
+                )
 
         avg_train_loss = train_loss_sum / max(len(train_loader), 1)
         avg_train_pred = train_pred_sum / max(len(train_loader), 1)
@@ -333,38 +387,63 @@ def train_with_config(cfg):
                 f"Gate Sep train/val: {avg_train_gate_sep:.3f}/{avg_val_gate_sep:.3f}"
             )
 
-        if device.type == 'cuda':
+        if device.type == "cuda":
             torch.cuda.empty_cache()
         gc.collect()
 
-    # 6) Save
     save_target_scaler = bool(cfg_get(cfg, "checkpoint.save_target_scaler", True))
+    checkpoint_metadata = build_checkpoint_metadata(
+        dataset_metadata=dataset_metadata,
+        solver_cfg=solver_cfg,
+        target_scaler_cfg=target_scaler_cfg,
+        target_scaler_enabled=save_target_scaler,
+    )
+    try:
+        validate_one_step_metadata(
+            checkpoint_metadata,
+            source_label="checkpoint-save",
+            expected_steps_ahead=1,
+            expected_stencil_size=stencil_size,
+            expected_phys_dim=phys_dim,
+            expected_feature_names=physics_feature_names(phys_dim),
+            expected_target_scaling=default_target_scaling_metadata(target_scaler_enabled=save_target_scaler),
+        )
+    except ValueError:
+        if strict_metadata:
+            raise
+        warnings.warn(
+            "Checkpoint metadata validation failed, continuing because metadata.strict=false.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
     save_dict = {
-        'model_state_dict': model.state_dict(),
-        'scaler_state': input_scaler.state_dict(),
-        'stencil_size': stencil_size,
-        'phys_dim': phys_dim,
-        'steps_ahead': steps_ahead,
-        'config': cfg,
+        "model_state_dict": model.state_dict(),
+        "scaler_state": input_scaler.state_dict(),
+        "stencil_size": stencil_size,
+        "phys_dim": phys_dim,
+        "steps_ahead": int(dataset_metadata.get("steps_ahead", 1)),
+        "config": cfg,
+        "metadata": checkpoint_metadata,
     }
     if save_target_scaler:
-        save_dict['target_scaler_state'] = target_scaler.state_dict()
+        save_dict["target_scaler_state"] = target_scaler.state_dict()
 
     model_save_path = Path(path_cfg.get("model_save_path", "kan_model.pth"))
     torch.save(save_dict, str(model_save_path))
     print(f"Model saved to '{model_save_path}'")
 
 
-def train(data_path='kan_train_data.npz', epochs=100, batch_size=4096, lr=1e-3, accumulation_steps=4, device=None):
+def train(data_path="kan_train_data.npz", epochs=100, batch_size=4096, lr=1e-3, accumulation_steps=4, device=None):
     """向后兼容入口：保留旧签名，内部转为配置驱动。"""
     cfg = load_config(None)
-    cfg['paths']['train_data_path'] = data_path
-    cfg['training']['epochs'] = epochs
-    cfg['training']['batch_size'] = batch_size
-    cfg['optimizer']['lr'] = lr
-    cfg['training']['accumulation_steps'] = accumulation_steps
+    cfg["paths"]["train_data_path"] = data_path
+    cfg["training"]["epochs"] = epochs
+    cfg["training"]["batch_size"] = batch_size
+    cfg["optimizer"]["lr"] = lr
+    cfg["training"]["accumulation_steps"] = accumulation_steps
     if device is not None:
-        cfg['runtime']['device'] = str(device)
+        cfg["runtime"]["device"] = str(device)
     return train_with_config(cfg)
 
 

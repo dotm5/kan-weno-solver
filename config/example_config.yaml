@@ -20,21 +20,30 @@ ablation:
   gate_mode: "raw_gate_only"
   hard_gate_sensor_threshold: 0.08
   soft_mask_width: 0.12
+  correction_sign_mode: "auto"
 
 logging:
   debug_rollout: true
   debug_t_start: 0.9
+  debug_sign_metrics: true
+  debug_gate_metrics: true
 
 evaluation:
   T_final: 2.0
   cfl: 0.35
+  remove_correction_mean: false
 
 plotting:
   dpi: 150
 
+# 元数据检查保持严格模式
+metadata:
+  strict: true
+
 # 数据生成参数（可单独用于 python -m data.generate）
 data_generation:
   num_samples: 8000
+  steps_ahead: 1
   num_sessions: 96
   sample_stride: 2
   seed: 2026

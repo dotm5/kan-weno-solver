@@ -2,6 +2,56 @@ import numpy as np
 from sklearn.preprocessing import StandardScaler
 
 
+class TargetAffineScaler:
+    """Affine target scaler shared by training and evaluation."""
+
+    def __init__(self, eps=1e-12, min_std=1e-8, clip_z=None):
+        self.eps = float(eps)
+        self.min_std = float(min_std)
+        self.clip_z = None if clip_z is None else float(clip_z)
+        self.mean = 0.0
+        self.std = 1.0
+
+    def fit(self, y):
+        y = np.asarray(y, dtype=np.float64)
+        self.mean = float(np.mean(y))
+        raw_std = float(np.std(y))
+        self.std = max(raw_std, self.min_std)
+        if raw_std < self.min_std:
+            print(
+                f"Warning: target std={raw_std:.3e} < min_std={self.min_std:.3e}, using std floor."
+            )
+        return self
+
+    def transform(self, y):
+        y = np.asarray(y, dtype=np.float64)
+        z = (y - self.mean) / max(self.std, self.eps)
+        if self.clip_z is not None:
+            z = np.clip(z, -self.clip_z, self.clip_z)
+        return z
+
+    def inverse_transform(self, y):
+        y = np.asarray(y, dtype=np.float64)
+        return y * self.std + self.mean
+
+    def state_dict(self):
+        return {
+            "mean": float(self.mean),
+            "std": float(self.std),
+            "min_std": float(self.min_std),
+            "clip_z": self.clip_z,
+            "eps": float(self.eps),
+        }
+
+    def load_state_dict(self, state):
+        self.eps = float(state.get("eps", self.eps))
+        self.min_std = float(state.get("min_std", self.min_std))
+        self.clip_z = state.get("clip_z", self.clip_z)
+        self.mean = float(state.get("mean", 0.0))
+        std = float(state.get("std", 1.0))
+        self.std = max(std, self.min_std)
+
+
 class HybridScaler:
     def __init__(self, stencil_size=9, eps=1e-8, clip_percentile_abs_features=99.5):
         self.stencil_size = stencil_size

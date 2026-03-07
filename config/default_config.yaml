@@ -49,7 +49,7 @@ scaler:
 target_scaler:
   eps: 1.0e-12
   min_std: 1.0e-8
-  clip_z: 8.0
+  clip_z: null          # one-step 默认不过度裁剪目标幅值
 
 # 损失与门控正则
 loss:
@@ -95,7 +95,7 @@ evaluation:
   N_ref: 2048
   T_final: 1.5
   cfl: 0.4
-  remove_correction_mean: true
+  remove_correction_mean: false   # 默认保持与训练一致，不额外去均值
   initial_condition:
     sin1_amp: 1.0
     sin2_amp: 0.5
@@ -104,7 +104,7 @@ evaluation:
 
 # 门控消融/推理门控策略
 ablation:
-  gate_mode: "soft_mask"   # original/raw_gate_only/gate_open/soft_mask
+  gate_mode: "train_equivalent"   # train_equivalent/raw_gate_only/soft_mask/hard_mask/gate_open
   hard_gate_sensor_threshold: 0.1
   soft_mask_center: 0.1
   soft_mask_width: 0.08
@@ -131,12 +131,17 @@ plotting:
 checkpoint:
   save_target_scaler: true
 
+# 元数据一致性检查
+metadata:
+  strict: true
+  warn_on_missing: true
+
 # 数据生成设置
 data_generation:
   num_samples: 5000
   N_coarse: 128
   N_fine: 2048
-  steps_ahead: 10
+  steps_ahead: 1        # 严格 one-step correction
   stencil_size: 9
   cfl: 0.5
   num_sessions: 64
