@@ -22,7 +22,8 @@ LEGACY_PHYSICS_FEATURE_NAMES = [
     "abs_u_x",
     "dt",
 ]
-FEATURE_LAYOUT_VERSION = "burgers_1d_phys_v2"
+FEATURE_LAYOUT_VERSION = "burgers_1d_phys_v3"
+LEGACY_FEATURE_LAYOUT_VERSIONS = {"burgers_1d_phys_v1", "burgers_1d_phys_v2"}
 
 
 def physics_feature_names(phys_dim: int) -> List[str]:
@@ -33,6 +34,53 @@ def physics_feature_names(phys_dim: int) -> List[str]:
     if phys_dim == len(LEGACY_PHYSICS_FEATURE_NAMES):
         return list(LEGACY_PHYSICS_FEATURE_NAMES)
     return [f"phys_{idx}" for idx in range(phys_dim)]
+
+
+def local_stencil_indices(stencil_size: int, stencil_radius: int) -> List[int]:
+    stencil_size = int(stencil_size)
+    stencil_radius = int(stencil_radius)
+    if stencil_size <= 0 or stencil_size % 2 == 0:
+        raise ValueError(f"stencil_size must be a positive odd integer, got {stencil_size}.")
+
+    center = stencil_size // 2
+    if stencil_radius < 0 or stencil_radius > center:
+        raise ValueError(
+            f"stencil_radius must satisfy 0 <= radius <= {center} for stencil_size={stencil_size}; "
+            f"got {stencil_radius}."
+        )
+
+    return list(range(center - stencil_radius, center + stencil_radius + 1))
+
+
+def build_feature_layout_metadata(
+    *,
+    stencil_size: int,
+    phys_dim: int,
+    physics_feature_names: Iterable[str] | None = None,
+    use_stencil_features: bool = True,
+    stencil_radius: int = 2,
+    gate_use_stencil_features: bool = False,
+) -> dict:
+    stencil_size = int(stencil_size)
+    phys_dim = int(phys_dim)
+    feature_names = ensure_feature_names(physics_feature_names, phys_dim)
+    correction_stencil_indices = (
+        local_stencil_indices(stencil_size, int(stencil_radius))
+        if bool(use_stencil_features)
+        else []
+    )
+    gate_stencil_indices = correction_stencil_indices if bool(gate_use_stencil_features) else []
+    return {
+        "input_layout": "full_stencil_plus_physics",
+        "stencil_size": stencil_size,
+        "phys_dim": phys_dim,
+        "physics_feature_names": list(feature_names),
+        "use_stencil_features": bool(use_stencil_features),
+        "stencil_radius": int(stencil_radius),
+        "correction_stencil_indices": list(correction_stencil_indices),
+        "gate_use_stencil_features": bool(gate_use_stencil_features),
+        "gate_stencil_indices": list(gate_stencil_indices),
+    }
 
 
 def require_integer_refinement(n_fine: int, n_coarse: int) -> int:

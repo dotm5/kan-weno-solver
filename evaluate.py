@@ -9,7 +9,7 @@ import torch
 
 matplotlib.use("Agg")
 
-from kan import GatedKAN, HybridScaler, TargetAffineScaler
+from kan import GatedKAN, HybridScaler, TargetAffineScaler, resolve_model_runtime_config
 from solvers.weno import rk3_step
 from utils.config import cfg_get, load_config, set_global_seed
 from utils.features import build_model_inputs, downsample_periodic, physics_feature_names, require_integer_refinement
@@ -138,8 +138,17 @@ class KANPredictor:
             )
 
         ckpt_model_cfg = checkpoint.get("config", {}).get("model", {}) if isinstance(checkpoint.get("config", {}), dict) else {}
-        model_cfg = dict(self.model_cfg)
-        model_cfg.update(ckpt_model_cfg)
+        self.model_runtime_cfg = resolve_model_runtime_config(
+            stencil_size=self.stencil_size,
+            artifact_model_cfg=ckpt_model_cfg,
+            fallback_model_cfg=self.model_cfg,
+            metadata=self.metadata,
+            prefer_legacy_when_missing=True,
+            warn_on_legacy=warn_on_missing,
+            source_label=str(model_path),
+        )
+        self.feature_layout = dict(self.metadata.get("feature_layout", {}))
+        self.correction_head = dict(self.metadata.get("correction_head", {}))
 
         self.scaler = HybridScaler(
             stencil_size=self.stencil_size,
@@ -166,15 +175,19 @@ class KANPredictor:
         self.model = GatedKAN(
             stencil_size=self.stencil_size,
             phys_dim=self.phys_dim,
-            hidden_dim=int(model_cfg.get("hidden_dim", 32)),
-            shape_grid_size=int(model_cfg.get("shape_grid_size", 10)),
-            shape_spline_order=int(model_cfg.get("shape_spline_order", 3)),
-            shape_output_scale=float(model_cfg.get("shape_output_scale", 0.5)),
-            gate_hidden_dims=tuple(model_cfg.get("gate_hidden_dims", [32, 16])),
-            gate_temperature=float(model_cfg.get("gate_temperature", 2.0)),
-            gate_bias_init=float(model_cfg.get("gate_bias_init", -1.0)),
-            shock_indicator_threshold=float(model_cfg.get("shock_indicator_threshold", 0.15)),
-            curvature_eps=float(model_cfg.get("curvature_eps", 1e-4)),
+            hidden_dim=int(self.model_runtime_cfg["hidden_dim"]),
+            shape_grid_size=int(self.model_runtime_cfg["shape_grid_size"]),
+            shape_spline_order=int(self.model_runtime_cfg["shape_spline_order"]),
+            correction_head_output_mode=str(self.model_runtime_cfg["correction_head_output_mode"]),
+            correction_head_output_scale=float(self.model_runtime_cfg["correction_head_output_scale"]),
+            use_stencil_features=bool(self.model_runtime_cfg["use_stencil_features"]),
+            stencil_radius=int(self.model_runtime_cfg["stencil_radius"]),
+            gate_use_stencil_features=bool(self.model_runtime_cfg["gate_use_stencil_features"]),
+            gate_hidden_dims=tuple(self.model_runtime_cfg["gate_hidden_dims"]),
+            gate_temperature=float(self.model_runtime_cfg["gate_temperature"]),
+            gate_bias_init=float(self.model_runtime_cfg["gate_bias_init"]),
+            shock_indicator_threshold=float(self.model_runtime_cfg["shock_indicator_threshold"]),
+            curvature_eps=float(self.model_runtime_cfg["curvature_eps"]),
         ).to(device)
 
         self.model.load_state_dict(checkpoint["model_state_dict"])
@@ -185,6 +198,14 @@ class KANPredictor:
             f"mode={self.gate_mode}, hard_thr={self.hard_gate_sensor_threshold:.3f}, "
             f"soft_center={self.soft_mask_center:.3f}, soft_width={self.soft_mask_width:.3f}, "
             f"soft_floor={self.soft_mask_floor:.3f}, corr_clip_abs={self.correction_clip_abs}"
+        )
+        print(
+            "Correction head config: "
+            f"mode={self.model_runtime_cfg['correction_head_output_mode']}, "
+            f"scale={self.model_runtime_cfg['correction_head_output_scale']:.3f}, "
+            f"use_stencil={self.model_runtime_cfg['use_stencil_features']}, "
+            f"stencil_radius={self.model_runtime_cfg['stencil_radius']}, "
+            f"gate_use_stencil={self.model_runtime_cfg['gate_use_stencil_features']}"
         )
 
     def _shock_sensor_from_inputs(self, inputs_norm):
@@ -227,16 +248,8 @@ class KANPredictor:
 
         return np.clip(eff, 0.0, 1.0), hard_mask, soft_mask, mask_for_stats, mode
 
-    def predict(self, u_current, dx, dt, t_stamp=0.0, return_debug=False, return_components=False):
-        inputs_raw = build_model_inputs(
-            u_current,
-            stencil_size=self.stencil_size,
-            dx=dx,
-            dt=dt,
-            t_stamp=t_stamp,
-            phys_dim=self.phys_dim,
-        )
-        inputs_norm = self.scaler.transform(inputs_raw)
+    def predict_from_inputs_raw(self, inputs_raw, return_debug=False, return_components=False):
+        inputs_norm = self.scaler.transform(np.asarray(inputs_raw))
         inputs_tensor = torch.as_tensor(inputs_norm, dtype=torch.float32, device=self.device)
 
         with torch.no_grad():
@@ -265,6 +278,9 @@ class KANPredictor:
 
             debug_metrics = {
                 "mode": mode,
+                "head_output_mode": self.model.correction_head_output_mode,
+                "head_output_scale": float(self.model.correction_head_output_scale),
+                "head_is_bounded": bool(self.model.correction_head_is_bounded),
                 "shock_indicator_min": float(np.min(shock_sensor)),
                 "shock_indicator_mean": float(np.mean(shock_sensor)),
                 "shock_indicator_max": float(np.max(shock_sensor)),
@@ -301,6 +317,21 @@ class KANPredictor:
                 return corr_phys, debug_metrics
             return corr_phys, None
 
+    def predict(self, u_current, dx, dt, t_stamp=0.0, return_debug=False, return_components=False):
+        inputs_raw = build_model_inputs(
+            u_current,
+            stencil_size=self.stencil_size,
+            dx=dx,
+            dt=dt,
+            t_stamp=t_stamp,
+            phys_dim=self.phys_dim,
+        )
+        return self.predict_from_inputs_raw(
+            inputs_raw,
+            return_debug=return_debug,
+            return_components=return_components,
+        )
+
 
 def _resolve_device(runtime_cfg):
     dev = str(runtime_cfg.get("device", "auto")).lower()
@@ -328,6 +359,7 @@ def _apply_legacy_overrides(cfg, legacy_kwargs):
         'N_ref': 'N_ref',
         'T_final': 'T_final',
         'cfl': 'cfl',
+        'correction_scale': 'correction_scale',
     }
     for k_old, k_new in eval_map.items():
         if k_old in legacy_kwargs and legacy_kwargs[k_old] is not None:
@@ -435,6 +467,8 @@ def _run_rollout_once(
     nu,
     weno_epsilon,
     correction_sign_mode,
+    correction_scale,
+    alpha=1.0,
     debug_rollout=False,
     debug_t_start=1.0,
     debug_sign_metrics=False,
@@ -459,6 +493,7 @@ def _run_rollout_once(
     u_truth = u_ref_init.copy()
 
     t, dx_coarse, dx_ref = 0.0, 2 * np.pi / N_coarse, 2 * np.pi / N_ref
+    effective_applied_scale = float(correction_scale) * float(alpha)
 
     history = {
         "time": [],
@@ -467,11 +502,15 @@ def _run_rollout_once(
         "raw_gate_mean": [],
         "effective_gate_mean": [],
         "mask_active_ratio": [],
+        "pred_corr_abs_mean": [],
+        "pred_corr_abs_max": [],
         "corr_abs_mean": [],
         "corr_abs_max": [],
         "baseline_update_abs_mean": [],
         "baseline_update_abs_max": [],
         "corr_to_baseline_ratio": [],
+        "correction_scale": [],
+        "effective_correction_scale": [],
     }
 
     one_pred_buf, one_true_buf, one_shock_buf = [], [], []
@@ -503,11 +542,13 @@ def _run_rollout_once(
         )
         pred_corr = corr.copy()
         corr_centered = corr - np.mean(corr) if remove_correction_mean else corr
-        applied_corr = sign_factor * corr_centered
+        applied_corr = effective_applied_scale * sign_factor * corr_centered
 
         baseline_update = u_weno_next - u_hybrid_prev
         base_abs_mean = float(np.mean(np.abs(baseline_update)))
         base_abs_max = float(np.max(np.abs(baseline_update)))
+        pred_corr_abs_mean = float(np.mean(np.abs(pred_corr)))
+        pred_corr_abs_max = float(np.max(np.abs(pred_corr)))
         corr_abs_mean = float(np.mean(np.abs(applied_corr)))
         corr_abs_max = float(np.max(np.abs(applied_corr)))
         corr_to_base = corr_abs_mean / (base_abs_mean + 1e-12)
@@ -535,12 +576,14 @@ def _run_rollout_once(
             print(
                 "DEBUG "
                 f"t={t:.3f} sign={resolved_sign_mode} mode={dbg['mode']} "
+                f"corr_scale={correction_scale:.3f} eff_scale={effective_applied_scale:.3f} "
                 f"raw_gate(mean/min/max)=({dbg['raw_gate_mean']:.3f}/{dbg['raw_gate_min']:.3f}/{dbg['raw_gate_max']:.3f}) "
                 f"eff_gate(mean/min/max)=({dbg['effective_gate_mean']:.3f}/{dbg['effective_gate_min']:.3f}/{dbg['effective_gate_max']:.3f}) "
                 f"mask_ratio={dbg['mask_active_ratio']:.3f} "
                 f"shock(mean/min/max)=({dbg['shock_indicator_mean']:.3f}/{dbg['shock_indicator_min']:.3f}/{dbg['shock_indicator_max']:.3f}) "
                 f"corr_before_gate_abs(mean/max)=({dbg['corr_before_gate_abs_mean']:.3e}/{dbg['corr_before_gate_abs_max']:.3e}) "
                 f"corr_after_gate_abs(mean/max)=({dbg['corr_after_gate_abs_mean']:.3e}/{dbg['corr_after_gate_abs_max']:.3e}) "
+                f"pred_corr_abs(mean/max)=({pred_corr_abs_mean:.3e}/{pred_corr_abs_max:.3e}) "
                 f"applied_corr_abs(mean/max)=({corr_abs_mean:.3e}/{corr_abs_max:.3e}) "
                 f"base_abs(mean/max)=({base_abs_mean:.3e}/{base_abs_max:.3e}) "
                 f"corr/base={corr_to_base:.3e}"
@@ -556,16 +599,23 @@ def _run_rollout_once(
         history["raw_gate_mean"].append(dbg["raw_gate_mean"])
         history["effective_gate_mean"].append(dbg["effective_gate_mean"])
         history["mask_active_ratio"].append(dbg["mask_active_ratio"])
+        history["pred_corr_abs_mean"].append(pred_corr_abs_mean)
+        history["pred_corr_abs_max"].append(pred_corr_abs_max)
         history["corr_abs_mean"].append(corr_abs_mean)
         history["corr_abs_max"].append(corr_abs_max)
         history["baseline_update_abs_mean"].append(base_abs_mean)
         history["baseline_update_abs_max"].append(base_abs_max)
         history["corr_to_baseline_ratio"].append(corr_to_base)
+        history["correction_scale"].append(float(correction_scale))
+        history["effective_correction_scale"].append(float(effective_applied_scale))
 
     result = {
         "history": history,
         "resolved_sign_mode": resolved_sign_mode,
         "sign_factor": sign_factor,
+        "correction_scale": float(correction_scale),
+        "alpha": float(alpha),
+        "effective_applied_scale": float(effective_applied_scale),
         "final_l2_base": float(history["l2_base"][-1]),
         "final_l2_hybrid": float(history["l2_hybrid"][-1]),
     }
@@ -603,6 +653,8 @@ def _run_rollout_once(
             "applied_corr_abs_max": float(np.max(np.abs(applied_corr))),
             "corr_to_baseline_ratio_mean": float(np.mean(history["corr_to_baseline_ratio"])),
             "corr_to_baseline_ratio_max": float(np.max(history["corr_to_baseline_ratio"])),
+            "correction_scale": float(correction_scale),
+            "effective_applied_scale": float(effective_applied_scale),
         }
 
     return result
@@ -680,6 +732,7 @@ def run_evaluation(cfg=None, **legacy_kwargs):
     N_ref = int(eval_cfg.get("N_ref", 2048))
     T_final = float(eval_cfg.get("T_final", 1.5))
     cfl = float(eval_cfg.get("cfl", 0.4))
+    correction_scale = float(eval_cfg.get("correction_scale", 0.25))
     remove_correction_mean = bool(eval_cfg.get("remove_correction_mean", False))
     ic_cfg = eval_cfg.get("initial_condition", {})
     nu = float(solver_cfg.get("nu", 0.0))
@@ -694,6 +747,7 @@ def run_evaluation(cfg=None, **legacy_kwargs):
     print(
         "Starting Rollout Evaluation... "
         f"correction_sign_mode={correction_sign_mode}, "
+        f"correction_scale={correction_scale:.3f}, "
         f"default_sign={predictor.default_correction_sign}, "
         f"gate_mode={predictor.gate_mode}, "
         f"remove_correction_mean={remove_correction_mean}, "
@@ -712,6 +766,8 @@ def run_evaluation(cfg=None, **legacy_kwargs):
         nu=nu,
         weno_epsilon=weno_epsilon,
         correction_sign_mode=correction_sign_mode,
+        correction_scale=correction_scale,
+        alpha=1.0,
         debug_rollout=debug_rollout,
         debug_t_start=debug_t_start,
         debug_sign_metrics=debug_sign_metrics,
@@ -724,7 +780,8 @@ def run_evaluation(cfg=None, **legacy_kwargs):
         f"final L2 baseline={main_result['final_l2_base']:.6e}, "
         f"final L2 hybrid={main_result['final_l2_hybrid']:.6e}, "
         f"ratio={main_result['final_l2_hybrid'] / (main_result['final_l2_base'] + 1e-12):.3f}, "
-        f"resolved_sign_mode={main_result['resolved_sign_mode']}"
+        f"resolved_sign_mode={main_result['resolved_sign_mode']}, "
+        f"effective_applied_scale={main_result['effective_applied_scale']:.3f}"
     )
 
     if debug_sign_metrics:
@@ -747,6 +804,8 @@ def run_evaluation(cfg=None, **legacy_kwargs):
                     nu=nu,
                     weno_epsilon=weno_epsilon,
                     correction_sign_mode=mode,
+                    correction_scale=correction_scale,
+                    alpha=1.0,
                     debug_rollout=False,
                     debug_sign_metrics=False,
                     debug_gate_metrics=False,

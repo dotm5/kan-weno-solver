@@ -10,11 +10,12 @@ import torch.optim as optim
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
 
-from kan import GatedKAN, HybridScaler, TargetAffineScaler
+from kan import GatedKAN, HybridScaler, HybridCorrectionLoss, TargetAffineScaler, resolve_model_runtime_config
 from utils.config import cfg_get, load_config, set_global_seed
-from utils.features import FEATURE_LAYOUT_VERSION, physics_feature_names
+from utils.features import FEATURE_LAYOUT_VERSION, build_feature_layout_metadata, physics_feature_names
 from utils.metadata import (
     build_checkpoint_metadata,
+    default_correction_head_metadata,
     default_target_scaling_metadata,
     extract_dataset_metadata,
     validate_one_step_metadata,
@@ -66,7 +67,15 @@ def _resolve_auto_flag(value, auto_default):
     return bool(value)
 
 
-def _prepare_dataset_metadata(data, *, data_path: Path, stencil_size: int, inferred_phys_dim: int, cfg):
+def _prepare_dataset_metadata(
+    data,
+    *,
+    data_path: Path,
+    stencil_size: int,
+    inferred_phys_dim: int,
+    cfg,
+    model_runtime_cfg,
+):
     warn_on_missing = bool(cfg_get(cfg, "metadata.warn_on_missing", True))
     strict_metadata = bool(cfg_get(cfg, "metadata.strict", True))
     cfg_steps_ahead = int(cfg_get(cfg, "data_generation.steps_ahead", 1))
@@ -86,6 +95,21 @@ def _prepare_dataset_metadata(data, *, data_path: Path, stencil_size: int, infer
     dataset_metadata.setdefault("phys_dim", inferred_phys_dim)
     dataset_metadata.setdefault("physics_feature_names", physics_feature_names(inferred_phys_dim))
     dataset_metadata.setdefault("feature_layout_version", FEATURE_LAYOUT_VERSION)
+    expected_feature_layout = build_feature_layout_metadata(
+        stencil_size=stencil_size,
+        phys_dim=inferred_phys_dim,
+        physics_feature_names=physics_feature_names(inferred_phys_dim),
+        use_stencil_features=bool(model_runtime_cfg["use_stencil_features"]),
+        stencil_radius=int(model_runtime_cfg["stencil_radius"]),
+        gate_use_stencil_features=bool(model_runtime_cfg["gate_use_stencil_features"]),
+    )
+    dataset_metadata.setdefault("feature_layout", expected_feature_layout)
+    expected_feature_layout_for_validation = (
+        expected_feature_layout
+        if dataset_metadata.get("feature_layout_version") == FEATURE_LAYOUT_VERSION
+        and not bool(dataset_metadata.get("feature_layout_inferred", False))
+        else None
+    )
 
     try:
         validate_one_step_metadata(
@@ -95,6 +119,7 @@ def _prepare_dataset_metadata(data, *, data_path: Path, stencil_size: int, infer
             expected_stencil_size=stencil_size,
             expected_phys_dim=inferred_phys_dim,
             expected_feature_names=physics_feature_names(inferred_phys_dim),
+            expected_feature_layout=expected_feature_layout_for_validation,
         )
     except ValueError:
         if strict_metadata:
@@ -136,19 +161,30 @@ def train_with_config(cfg):
     y = data["y"].astype(np.float32)
     stencil_size = int(data["stencil_size"])
     inferred_phys_dim = int(X.shape[1] - stencil_size)
+    model_runtime_cfg = resolve_model_runtime_config(
+        stencil_size=stencil_size,
+        artifact_model_cfg=model_cfg,
+        fallback_model_cfg={},
+        metadata=None,
+        prefer_legacy_when_missing=False,
+        warn_on_legacy=True,
+        source_label="train-config",
+    )
     dataset_metadata = _prepare_dataset_metadata(
         data,
         data_path=data_path,
         stencil_size=stencil_size,
         inferred_phys_dim=inferred_phys_dim,
         cfg=cfg,
+        model_runtime_cfg=model_runtime_cfg,
     )
     phys_dim = int(dataset_metadata.get("phys_dim", inferred_phys_dim))
     print(
         "Dataset metadata: "
         f"steps_ahead={dataset_metadata.get('steps_ahead')}, "
         f"phys_dim={phys_dim}, "
-        f"feature_layout={dataset_metadata.get('feature_layout_version')}"
+        f"feature_layout={dataset_metadata.get('feature_layout_version')}, "
+        f"corr_head={model_runtime_cfg['correction_head_output_mode']}"
     )
 
     X_train_raw, X_val_raw, y_train_raw, y_val_raw = train_test_split(
@@ -201,15 +237,19 @@ def train_with_config(cfg):
     model = GatedKAN(
         stencil_size=stencil_size,
         phys_dim=phys_dim,
-        hidden_dim=int(model_cfg.get("hidden_dim", 32)),
-        shape_grid_size=int(model_cfg.get("shape_grid_size", 10)),
-        shape_spline_order=int(model_cfg.get("shape_spline_order", 3)),
-        shape_output_scale=float(model_cfg.get("shape_output_scale", 0.5)),
-        gate_hidden_dims=tuple(model_cfg.get("gate_hidden_dims", [32, 16])),
-        gate_temperature=float(model_cfg.get("gate_temperature", 2.0)),
-        gate_bias_init=float(model_cfg.get("gate_bias_init", -1.0)),
-        shock_indicator_threshold=float(model_cfg.get("shock_indicator_threshold", 0.15)),
-        curvature_eps=float(model_cfg.get("curvature_eps", 1e-4)),
+        hidden_dim=int(model_runtime_cfg["hidden_dim"]),
+        shape_grid_size=int(model_runtime_cfg["shape_grid_size"]),
+        shape_spline_order=int(model_runtime_cfg["shape_spline_order"]),
+        correction_head_output_mode=str(model_runtime_cfg["correction_head_output_mode"]),
+        correction_head_output_scale=float(model_runtime_cfg["correction_head_output_scale"]),
+        use_stencil_features=bool(model_runtime_cfg["use_stencil_features"]),
+        stencil_radius=int(model_runtime_cfg["stencil_radius"]),
+        gate_use_stencil_features=bool(model_runtime_cfg["gate_use_stencil_features"]),
+        gate_hidden_dims=tuple(model_runtime_cfg["gate_hidden_dims"]),
+        gate_temperature=float(model_runtime_cfg["gate_temperature"]),
+        gate_bias_init=float(model_runtime_cfg["gate_bias_init"]),
+        shock_indicator_threshold=float(model_runtime_cfg["shock_indicator_threshold"]),
+        curvature_eps=float(model_runtime_cfg["curvature_eps"]),
     ).to(device)
 
     if str(opt_cfg.get("type", "adamw")).lower() != "adamw":
@@ -240,7 +280,10 @@ def train_with_config(cfg):
     target_std_t = torch.tensor(target_scaler.std, dtype=torch.float32, device=device)
 
     smooth_l1_beta = float(loss_cfg.get("smooth_l1_beta", 1.0))
+    shock_weight = float(loss_cfg.get("shock_weight", 5.0))
     smooth_threshold = float(loss_cfg.get("gate_smooth_threshold", 0.1))
+    smooth_penalty_weight = float(loss_cfg.get("smooth_penalty_weight", 0.0))
+    locality_penalty_weight = float(loss_cfg.get("locality_penalty_weight", 0.0))
     separation_margin = float(loss_cfg.get("gate_separation_margin", 0.05))
     gate_sparsity_w = float(loss_cfg.get("gate_sparsity_weight", 2e-2))
     gate_separation_w = float(loss_cfg.get("gate_separation_weight", 5e-1))
@@ -249,6 +292,13 @@ def train_with_config(cfg):
     gate_reg_scale_min = float(loss_cfg.get("gate_reg_scale_min", 1.0))
     gate_reg_scale_max = float(loss_cfg.get("gate_reg_scale_max", 25.0))
     phys_weight_factor = float(loss_cfg.get("phys_weight_factor", 5.0))
+    correction_loss_fn = HybridCorrectionLoss(
+        smooth_l1_beta=smooth_l1_beta,
+        shock_weight=shock_weight,
+        smooth_threshold=smooth_threshold,
+        smooth_penalty_weight=smooth_penalty_weight,
+        locality_penalty_weight=locality_penalty_weight,
+    )
 
     accumulation_steps = int(train_cfg.get("accumulation_steps", 4))
     grad_clip_norm = float(train_cfg.get("grad_clip_norm", 1.0))
@@ -261,6 +311,7 @@ def train_with_config(cfg):
 
         train_loss_sum = 0.0
         train_pred_sum = 0.0
+        train_pred_total_sum = 0.0
         train_gate_sep_sum = 0.0
 
         for i, (batch_X, batch_y) in enumerate(train_loader):
@@ -270,8 +321,15 @@ def train_with_config(cfg):
 
             with torch.amp.autocast(device_type=autocast_device, enabled=use_amp and device.type == "cuda"):
                 pred_z, gate = model(batch_X)
+                pred_phys = pred_z * target_std_t + target_mean_t
 
-                pred_loss = F.smooth_l1_loss(pred_z, batch_y, beta=smooth_l1_beta)
+                pred_terms = correction_loss_fn(
+                    pred_z,
+                    batch_y,
+                    shock_metric=shock_metric,
+                    pred_phys=pred_phys,
+                )
+                pred_loss = pred_terms["total"]
 
                 gate_smooth, gate_shock, sparsity_core, separation_core, shock_open_core = _gate_terms(
                     gate,
@@ -301,7 +359,8 @@ def train_with_config(cfg):
                 optimizer.zero_grad(set_to_none=True)
 
             train_loss_sum += loss.item() * accumulation_steps
-            train_pred_sum += pred_loss.item()
+            train_pred_sum += pred_terms["weighted_smooth_l1"].item()
+            train_pred_total_sum += pred_loss.item()
             train_gate_sep_sum += (gate_shock - gate_smooth).item()
 
             del (
@@ -309,7 +368,9 @@ def train_with_config(cfg):
                 batch_y,
                 shock_metric,
                 pred_z,
+                pred_phys,
                 gate,
+                pred_terms,
                 pred_loss,
                 gate_smooth,
                 gate_shock,
@@ -323,6 +384,7 @@ def train_with_config(cfg):
 
         model.eval()
         val_pred_sum = 0.0
+        val_pred_total_sum = 0.0
         val_phys_wmse_sum = 0.0
         val_gate_sep_sum = 0.0
         batch_count = 0
@@ -337,10 +399,16 @@ def train_with_config(cfg):
                 shock_metric = batch_X[:, shock_feature_idx]
 
                 pred_z, gate = model(batch_X)
-                pred_loss = F.smooth_l1_loss(pred_z, batch_y, beta=smooth_l1_beta)
-                val_pred_sum += pred_loss.item() * batch_X.size(0)
-
                 pred_phys = pred_z * target_std_t + target_mean_t
+                pred_terms = correction_loss_fn(
+                    pred_z,
+                    batch_y,
+                    shock_metric=shock_metric,
+                    pred_phys=pred_phys,
+                )
+                pred_loss = pred_terms["weighted_smooth_l1"]
+                val_pred_sum += pred_loss.item() * batch_X.size(0)
+                val_pred_total_sum += pred_terms["total"].item() * batch_X.size(0)
                 target_phys = batch_y * target_std_t + target_mean_t
                 weights = 1.0 + phys_weight_factor * torch.abs(target_phys)
                 wmse_phys = torch.mean(weights * (pred_phys - target_phys) ** 2)
@@ -361,6 +429,7 @@ def train_with_config(cfg):
                     shock_metric,
                     pred_z,
                     gate,
+                    pred_terms,
                     pred_loss,
                     pred_phys,
                     target_phys,
@@ -372,9 +441,11 @@ def train_with_config(cfg):
 
         avg_train_loss = train_loss_sum / max(len(train_loader), 1)
         avg_train_pred = train_pred_sum / max(len(train_loader), 1)
+        avg_train_pred_total = train_pred_total_sum / max(len(train_loader), 1)
         avg_train_gate_sep = train_gate_sep_sum / max(len(train_loader), 1)
 
         avg_val_pred = val_pred_sum / max(batch_count, 1)
+        avg_val_pred_total = val_pred_total_sum / max(batch_count, 1)
         avg_val_phys_wmse = val_phys_wmse_sum / max(batch_count, 1)
         avg_val_gate_sep = val_gate_sep_sum / max(batch_count, 1)
 
@@ -382,8 +453,9 @@ def train_with_config(cfg):
 
         if epoch % log_every == 0:
             print(
-                f"Epoch {epoch:3d} | Loss(total): {avg_train_loss:.2e} | Pred(z): {avg_train_pred:.2e} | "
-                f"Val Pred(z): {avg_val_pred:.2e} | Val W-MSE(phys): {avg_val_phys_wmse:.2e} | "
+                f"Epoch {epoch:3d} | Loss(total): {avg_train_loss:.2e} | Pred(z,w): {avg_train_pred:.2e} | "
+                f"Pred(all): {avg_train_pred_total:.2e} | Val Pred(z,w): {avg_val_pred:.2e} | "
+                f"Val Pred(all): {avg_val_pred_total:.2e} | Val W-MSE(phys): {avg_val_phys_wmse:.2e} | "
                 f"Gate Sep train/val: {avg_train_gate_sep:.3f}/{avg_val_gate_sep:.3f}"
             )
 
@@ -392,11 +464,25 @@ def train_with_config(cfg):
         gc.collect()
 
     save_target_scaler = bool(cfg_get(cfg, "checkpoint.save_target_scaler", True))
+    feature_layout_metadata = build_feature_layout_metadata(
+        stencil_size=stencil_size,
+        phys_dim=phys_dim,
+        physics_feature_names=physics_feature_names(phys_dim),
+        use_stencil_features=bool(model_runtime_cfg["use_stencil_features"]),
+        stencil_radius=int(model_runtime_cfg["stencil_radius"]),
+        gate_use_stencil_features=bool(model_runtime_cfg["gate_use_stencil_features"]),
+    )
+    correction_head_metadata = default_correction_head_metadata(
+        output_mode=str(model_runtime_cfg["correction_head_output_mode"]),
+        output_scale=float(model_runtime_cfg["correction_head_output_scale"]),
+    )
     checkpoint_metadata = build_checkpoint_metadata(
         dataset_metadata=dataset_metadata,
         solver_cfg=solver_cfg,
         target_scaler_cfg=target_scaler_cfg,
         target_scaler_enabled=save_target_scaler,
+        correction_head_cfg=correction_head_metadata,
+        feature_layout=feature_layout_metadata,
     )
     try:
         validate_one_step_metadata(
@@ -407,6 +493,8 @@ def train_with_config(cfg):
             expected_phys_dim=phys_dim,
             expected_feature_names=physics_feature_names(phys_dim),
             expected_target_scaling=default_target_scaling_metadata(target_scaler_enabled=save_target_scaler),
+            expected_feature_layout=feature_layout_metadata,
+            expected_correction_head=correction_head_metadata,
         )
     except ValueError:
         if strict_metadata:

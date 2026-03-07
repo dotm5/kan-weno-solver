@@ -10,11 +10,18 @@ from kan import GatedKAN, HybridScaler, TargetAffineScaler
 from solvers.weno import weno5_flux_splitting
 from train import train_with_config
 from utils.config import load_config
-from utils.features import downsample_periodic, physics_feature_names, require_integer_refinement
+from utils.features import (
+    build_feature_layout_metadata,
+    downsample_periodic,
+    local_stencil_indices,
+    physics_feature_names,
+    require_integer_refinement,
+)
 from utils.metadata import (
     ONE_STEP_TARGET_SEMANTICS,
     build_checkpoint_metadata,
     build_dataset_metadata,
+    default_correction_head_metadata,
     deserialize_metadata,
 )
 
@@ -37,6 +44,39 @@ def test_gated_kan_shape():
     assert gated_corr.shape == (batch_size, 1)
     assert torch.allclose(correction, gated_corr)
     assert (gate >= 0).all() and (gate <= 1).all()
+
+
+def test_gated_kan_head_modes_and_stencil_mask():
+    stencil_size = 9
+    phys_dim = 7
+    x = torch.randn(8, stencil_size + phys_dim)
+
+    bounded_model = GatedKAN(
+        stencil_size=stencil_size,
+        phys_dim=phys_dim,
+        correction_head_output_mode="softsign_scaled",
+        correction_head_output_scale=0.25,
+        stencil_radius=2,
+    )
+    raw_corr, _, _ = bounded_model.forward_components(x)
+    assert torch.max(torch.abs(raw_corr)) <= 0.25 + 1e-6
+    assert bounded_model.correction_stencil_indices == tuple(local_stencil_indices(stencil_size, 2))
+
+    linear_model = GatedKAN(
+        stencil_size=stencil_size,
+        phys_dim=phys_dim,
+        correction_head_output_mode="linear",
+        correction_head_output_scale=1.0,
+        stencil_radius=2,
+    )
+    linear_corr, _, _ = linear_model.forward_components(x)
+    assert torch.max(torch.abs(linear_corr)) > 0.25
+
+
+def test_local_stencil_indices_validation():
+    assert local_stencil_indices(9, 2) == [2, 3, 4, 5, 6]
+    with pytest.raises(ValueError, match="stencil_radius"):
+        local_stencil_indices(9, 5)
 
 
 def test_weno5_flux_splitting():
@@ -105,6 +145,7 @@ def test_one_step_pair_and_dataset_metadata(tmp_path):
     assert int(data["phys_dim"]) == 7
     assert metadata["target_semantics"] == ONE_STEP_TARGET_SEMANTICS
     assert metadata["target_definition"] == "u_ref_next - u_weno_next"
+    assert metadata["feature_layout"]["correction_stencil_indices"] == [0, 1, 2, 3, 4]
 
 
 def test_train_smoke_and_checkpoint_metadata(tmp_path):
@@ -142,6 +183,8 @@ def test_train_smoke_and_checkpoint_metadata(tmp_path):
     assert "config" in checkpoint
     assert "metadata" in checkpoint
     assert checkpoint["metadata"]["steps_ahead"] == 1
+    assert checkpoint["metadata"]["correction_head"]["output_mode"] == "linear"
+    assert checkpoint["metadata"]["feature_layout"]["correction_stencil_indices"] == [2, 3, 4, 5, 6]
 
 
 def test_train_rejects_multistep_dataset(tmp_path):
@@ -164,7 +207,7 @@ def test_train_rejects_multistep_dataset(tmp_path):
         train_with_config(cfg)
 
 
-def _write_synthetic_checkpoint(path):
+def _write_synthetic_checkpoint(path, *, legacy=False):
     stencil_size = 9
     phys_dim = 7
     X = np.random.randn(64, stencil_size + phys_dim).astype(np.float32)
@@ -173,7 +216,21 @@ def _write_synthetic_checkpoint(path):
     scaler = HybridScaler(stencil_size=stencil_size)
     scaler.fit(X)
     target_scaler = TargetAffineScaler().fit(y)
-    model = GatedKAN(stencil_size=stencil_size, phys_dim=phys_dim)
+    if legacy:
+        model = GatedKAN(
+            stencil_size=stencil_size,
+            phys_dim=phys_dim,
+            shape_output_scale=0.5,
+            stencil_radius=stencil_size // 2,
+        )
+    else:
+        model = GatedKAN(
+            stencil_size=stencil_size,
+            phys_dim=phys_dim,
+            correction_head_output_mode="linear",
+            correction_head_output_scale=1.0,
+            stencil_radius=2,
+        )
 
     dataset_metadata = build_dataset_metadata(
         steps_ahead=1,
@@ -182,13 +239,33 @@ def _write_synthetic_checkpoint(path):
         physics_feature_names=physics_feature_names(phys_dim),
         solver_cfg={"nu": 0.0, "weno_epsilon": 1e-6},
         generation_cfg={"N_coarse": 16, "N_fine": 64, "cfl": 0.2, "sample_stride": 1, "num_sessions": 1},
+        feature_layout=build_feature_layout_metadata(
+            stencil_size=stencil_size,
+            phys_dim=phys_dim,
+            physics_feature_names=physics_feature_names(phys_dim),
+            use_stencil_features=True,
+            stencil_radius=2,
+            gate_use_stencil_features=False,
+        ),
     )
     checkpoint_metadata = build_checkpoint_metadata(
         dataset_metadata=dataset_metadata,
         solver_cfg={"nu": 0.0, "weno_epsilon": 1e-6},
         target_scaler_cfg={"clip_z": None, "min_std": 1e-8},
         target_scaler_enabled=True,
+        correction_head_cfg=default_correction_head_metadata(output_mode="linear", output_scale=1.0),
+        feature_layout=dataset_metadata["feature_layout"],
     )
+    model_cfg = {
+        "correction_head": {"output_mode": "linear", "output_scale": 1.0},
+        "use_stencil_features": True,
+        "stencil_radius": 2,
+        "gate_use_stencil_features": False,
+    }
+    if legacy:
+        checkpoint_metadata.pop("correction_head", None)
+        checkpoint_metadata.pop("feature_layout", None)
+        model_cfg = {"shape_output_scale": 0.5}
 
     torch.save(
         {
@@ -198,7 +275,7 @@ def _write_synthetic_checkpoint(path):
             "stencil_size": stencil_size,
             "phys_dim": phys_dim,
             "steps_ahead": 1,
-            "config": {"model": {}},
+            "config": {"model": model_cfg},
             "metadata": checkpoint_metadata,
         },
         str(path),
@@ -232,6 +309,20 @@ def test_predictor_gate_modes_consistent(tmp_path):
     assert dbg_hard["effective_gate_mean"] <= dbg_train["effective_gate_mean"] + 1e-8
 
 
+def test_predictor_loads_legacy_checkpoint_defaults(tmp_path):
+    ckpt_path = tmp_path / "legacy_ckpt.pth"
+    _write_synthetic_checkpoint(ckpt_path, legacy=True)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        predictor = KANPredictor(str(ckpt_path), device="cpu")
+
+    assert predictor.model_runtime_cfg["correction_head_output_mode"] == "softsign_scaled"
+    assert predictor.model_runtime_cfg["correction_head_output_scale"] == pytest.approx(0.5)
+    assert predictor.model_runtime_cfg["stencil_radius"] == 4
+    assert any("inferring legacy" in str(item.message) for item in caught)
+
+
 def test_run_evaluation_auto_sign_uses_plus(tmp_path):
     """Auto sign should resolve to plus for the strict one-step target definition."""
     ckpt_path = tmp_path / "eval_ckpt.pth"
@@ -256,3 +347,46 @@ def test_run_evaluation_auto_sign_uses_plus(tmp_path):
     assert result["resolved_sign_mode"] == "plus"
     assert result["final_l2_base"] >= 0.0
     assert result["final_l2_hybrid"] >= 0.0
+    assert result["effective_applied_scale"] == pytest.approx(0.25)
+
+
+def test_run_evaluation_correction_scale_controls_applied_magnitude(tmp_path):
+    ckpt_path = tmp_path / "scale_ckpt.pth"
+    _write_synthetic_checkpoint(ckpt_path)
+
+    base_cfg = load_config(None)
+    base_cfg["paths"]["model_save_path"] = str(ckpt_path)
+    base_cfg["runtime"]["device"] = "cpu"
+    base_cfg["evaluation"]["N_coarse"] = 16
+    base_cfg["evaluation"]["N_ref"] = 64
+    base_cfg["evaluation"]["T_final"] = 0.05
+    base_cfg["evaluation"]["cfl"] = 0.2
+    base_cfg["plotting"]["enabled"] = False
+    base_cfg["logging"]["debug_sign_metrics"] = False
+    base_cfg["logging"]["debug_gate_metrics"] = False
+
+    cfg_zero = load_config(None)
+    cfg_zero.update(base_cfg)
+    cfg_zero["paths"] = dict(base_cfg["paths"])
+    cfg_zero["runtime"] = dict(base_cfg["runtime"])
+    cfg_zero["evaluation"] = dict(base_cfg["evaluation"])
+    cfg_zero["plotting"] = dict(base_cfg["plotting"])
+    cfg_zero["logging"] = dict(base_cfg["logging"])
+    cfg_zero["evaluation"]["correction_scale"] = 0.0
+
+    cfg_half = load_config(None)
+    cfg_half.update(base_cfg)
+    cfg_half["paths"] = dict(base_cfg["paths"])
+    cfg_half["runtime"] = dict(base_cfg["runtime"])
+    cfg_half["evaluation"] = dict(base_cfg["evaluation"])
+    cfg_half["plotting"] = dict(base_cfg["plotting"])
+    cfg_half["logging"] = dict(base_cfg["logging"])
+    cfg_half["evaluation"]["correction_scale"] = 0.5
+
+    result_zero = run_evaluation(cfg_zero)
+    result_half = run_evaluation(cfg_half)
+
+    assert result_zero["effective_applied_scale"] == pytest.approx(0.0)
+    assert result_half["effective_applied_scale"] == pytest.approx(0.5)
+    assert np.max(result_zero["history"]["corr_abs_mean"]) == pytest.approx(0.0, abs=1e-12)
+    assert np.max(result_half["history"]["corr_abs_mean"]) >= 0.0

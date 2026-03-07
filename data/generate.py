@@ -8,6 +8,7 @@ from solvers.weno import rk3_step
 from utils.config import load_config, set_global_seed
 from utils.features import (
     CANONICAL_PHYSICS_FEATURE_NAMES,
+    build_feature_layout_metadata,
     build_model_inputs,
     downsample_periodic,
     require_integer_refinement,
@@ -227,6 +228,9 @@ def generate_dataset(
     warmup_factor=4,
     max_rollout_factor=3,
     progress_bar_width=30,
+    use_stencil_features=True,
+    stencil_radius=2,
+    gate_use_stencil_features=False,
 ):
     if int(steps_ahead) != 1:
         raise ValueError(
@@ -316,6 +320,14 @@ def generate_dataset(
             "sample_stride": sample_stride,
             "num_sessions": num_sessions,
         },
+        feature_layout=build_feature_layout_metadata(
+            stencil_size=stencil_size,
+            phys_dim=phys_dim,
+            physics_feature_names=CANONICAL_PHYSICS_FEATURE_NAMES,
+            use_stencil_features=bool(use_stencil_features),
+            stencil_radius=int(stencil_radius),
+            gate_use_stencil_features=bool(gate_use_stencil_features),
+        ),
     )
 
     output_path = Path(output_path)
@@ -395,4 +407,7 @@ if __name__ == "__main__":
         warmup_factor=int(gen_cfg.get("warmup_factor", 4)),
         max_rollout_factor=int(gen_cfg.get("max_rollout_factor", 3)),
         progress_bar_width=int(gen_cfg.get("progress_bar_width", 30)),
+        use_stencil_features=bool(cfg.get("model", {}).get("use_stencil_features", True)),
+        stencil_radius=int(cfg.get("model", {}).get("stencil_radius", 2)),
+        gate_use_stencil_features=bool(cfg.get("model", {}).get("gate_use_stencil_features", False)),
     )

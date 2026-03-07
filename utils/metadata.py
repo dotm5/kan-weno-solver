@@ -8,7 +8,12 @@ from typing import Any, Dict
 
 import numpy as np
 
-from utils.features import FEATURE_LAYOUT_VERSION, ensure_feature_names
+from utils.features import (
+    FEATURE_LAYOUT_VERSION,
+    LEGACY_FEATURE_LAYOUT_VERSIONS,
+    build_feature_layout_metadata,
+    ensure_feature_names,
+)
 
 
 ONE_STEP_TARGET_SEMANTICS = "one_step_correction"
@@ -16,6 +21,10 @@ ONE_STEP_TARGET_DEFINITION = "u_ref_next - u_weno_next"
 TARGET_SPACE_PHYSICAL_CORRECTION = "physical_correction"
 TARGET_SCALER_TYPE_AFFINE = "affine"
 REFERENCE_MODE_PAIRED_FINE = "paired_fine_rollout_stride_downsample"
+DEFAULT_CORRECTION_HEAD_MODE = "linear"
+DEFAULT_CORRECTION_HEAD_SCALE = 1.0
+LEGACY_CORRECTION_HEAD_MODE = "softsign_scaled"
+LEGACY_CORRECTION_HEAD_SCALE = 0.5
 
 
 def _warn(message: str) -> None:
@@ -55,9 +64,10 @@ def build_dataset_metadata(
     physics_feature_names: list[str],
     solver_cfg: Dict[str, Any],
     generation_cfg: Dict[str, Any],
+    feature_layout: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     return {
-        "metadata_version": 2,
+        "metadata_version": 3,
         "source_kind": "dataset",
         "target_semantics": ONE_STEP_TARGET_SEMANTICS,
         "target_definition": ONE_STEP_TARGET_DEFINITION,
@@ -67,6 +77,15 @@ def build_dataset_metadata(
         "phys_dim": int(phys_dim),
         "physics_feature_names": list(physics_feature_names),
         "feature_layout_version": FEATURE_LAYOUT_VERSION,
+        "feature_layout": feature_layout
+        or build_feature_layout_metadata(
+            stencil_size=stencil_size,
+            phys_dim=phys_dim,
+            physics_feature_names=physics_feature_names,
+            use_stencil_features=True,
+            stencil_radius=int(stencil_size) // 2,
+            gate_use_stencil_features=False,
+        ),
         "reference_mode": REFERENCE_MODE_PAIRED_FINE,
         "solver": {
             "nu": float(solver_cfg.get("nu", 0.0)),
@@ -88,11 +107,13 @@ def build_checkpoint_metadata(
     solver_cfg: Dict[str, Any],
     target_scaler_cfg: Dict[str, Any],
     target_scaler_enabled: bool,
+    correction_head_cfg: Dict[str, Any] | None = None,
+    feature_layout: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     metadata = dict(dataset_metadata)
     metadata.update(
         {
-            "metadata_version": 2,
+            "metadata_version": 3,
             "source_kind": "checkpoint",
             "solver": {
                 "nu": float(solver_cfg.get("nu", 0.0)),
@@ -105,6 +126,12 @@ def build_checkpoint_metadata(
                 "clip_z": target_scaler_cfg.get("clip_z", None),
                 "min_std": float(target_scaler_cfg.get("min_std", 1e-8)),
             },
+            "correction_head": correction_head_cfg
+            or {
+                "output_mode": DEFAULT_CORRECTION_HEAD_MODE,
+                "output_scale": DEFAULT_CORRECTION_HEAD_SCALE,
+            },
+            "feature_layout": feature_layout or dataset_metadata.get("feature_layout"),
             "default_correction_sign": "plus",
             "dataset_metadata": dataset_metadata,
         }
@@ -140,6 +167,12 @@ def extract_dataset_metadata(npz_data: Any, *, source_label: str, warn_on_missin
     if "feature_layout_version" not in metadata and metadata.get("phys_dim") is not None:
         metadata["feature_layout_version"] = FEATURE_LAYOUT_VERSION
 
+    _ensure_feature_layout_metadata(
+        metadata,
+        source_label=source_label,
+        warn_on_missing=warn_on_missing,
+    )
+
     return metadata
 
 
@@ -165,6 +198,18 @@ def extract_checkpoint_metadata(
     if "feature_layout_version" not in metadata and metadata.get("phys_dim") is not None:
         metadata["feature_layout_version"] = FEATURE_LAYOUT_VERSION
 
+    _ensure_feature_layout_metadata(
+        metadata,
+        source_label=source_label,
+        warn_on_missing=warn_on_missing,
+    )
+    _ensure_correction_head_metadata(
+        metadata,
+        checkpoint=checkpoint,
+        source_label=source_label,
+        warn_on_missing=warn_on_missing,
+    )
+
     return metadata
 
 
@@ -177,6 +222,8 @@ def validate_one_step_metadata(
     expected_phys_dim: int | None = None,
     expected_feature_names: list[str] | None = None,
     expected_target_scaling: Dict[str, Any] | None = None,
+    expected_feature_layout: Dict[str, Any] | None = None,
+    expected_correction_head: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     mismatches: list[str] = []
 
@@ -219,10 +266,24 @@ def validate_one_step_metadata(
             )
 
     feature_layout_version = metadata.get("feature_layout_version")
-    if feature_layout_version is not None and feature_layout_version != FEATURE_LAYOUT_VERSION:
+    if (
+        feature_layout_version is not None
+        and feature_layout_version != FEATURE_LAYOUT_VERSION
+        and feature_layout_version not in LEGACY_FEATURE_LAYOUT_VERSIONS
+    ):
         mismatches.append(
             f"feature_layout_version: expected {FEATURE_LAYOUT_VERSION!r}, got {feature_layout_version!r}"
         )
+
+    if expected_feature_layout is not None:
+        feature_layout = metadata.get("feature_layout")
+        if feature_layout is None:
+            mismatches.append("feature_layout: missing dataset/checkpoint feature layout metadata")
+        else:
+            for key, expected in expected_feature_layout.items():
+                actual = feature_layout.get(key)
+                if actual is not None and actual != expected:
+                    mismatches.append(f"feature_layout.{key}: expected {expected!r}, got {actual!r}")
 
     if expected_target_scaling is not None:
         scaling = metadata.get("target_scaling")
@@ -233,6 +294,16 @@ def validate_one_step_metadata(
                 actual = scaling.get(key)
                 if actual != expected:
                     mismatches.append(f"target_scaling.{key}: expected {expected!r}, got {actual!r}")
+
+    if expected_correction_head is not None:
+        correction_head = metadata.get("correction_head")
+        if correction_head is None:
+            mismatches.append("correction_head: missing checkpoint correction_head metadata")
+        else:
+            for key, expected in expected_correction_head.items():
+                actual = correction_head.get(key)
+                if actual is not None and actual != expected:
+                    mismatches.append(f"correction_head.{key}: expected {expected!r}, got {actual!r}")
 
     if mismatches:
         raise ValueError(
@@ -248,6 +319,17 @@ def default_target_scaling_metadata(*, target_scaler_enabled: bool) -> Dict[str,
         "target_space": TARGET_SPACE_PHYSICAL_CORRECTION,
         "scaler_type": TARGET_SCALER_TYPE_AFFINE,
         "state_required": bool(target_scaler_enabled),
+    }
+
+
+def default_correction_head_metadata(
+    *,
+    output_mode: str = DEFAULT_CORRECTION_HEAD_MODE,
+    output_scale: float = DEFAULT_CORRECTION_HEAD_SCALE,
+) -> Dict[str, Any]:
+    return {
+        "output_mode": str(output_mode).lower(),
+        "output_scale": float(output_scale),
     }
 
 
@@ -267,3 +349,79 @@ def _coerce_scalar(value: Any) -> Any:
     if isinstance(value, np.ndarray) and value.shape == ():
         return value.item()
     return value
+
+
+def _ensure_feature_layout_metadata(
+    metadata: Dict[str, Any],
+    *,
+    source_label: str,
+    warn_on_missing: bool,
+) -> None:
+    stencil_size = metadata.get("stencil_size")
+    phys_dim = metadata.get("phys_dim")
+    if stencil_size is None or phys_dim is None:
+        return
+
+    if "feature_layout" not in metadata:
+        if warn_on_missing:
+            _warn(
+                f"{source_label}: feature_layout missing, inferring legacy full-stencil correction layout."
+            )
+        metadata["feature_layout_inferred"] = True
+        metadata["feature_layout"] = build_feature_layout_metadata(
+            stencil_size=int(stencil_size),
+            phys_dim=int(phys_dim),
+            physics_feature_names=metadata.get("physics_feature_names"),
+            use_stencil_features=True,
+            stencil_radius=int(stencil_size) // 2,
+            gate_use_stencil_features=False,
+        )
+    else:
+        metadata.setdefault("feature_layout_inferred", False)
+    metadata["feature_layout"].setdefault("input_layout", "full_stencil_plus_physics")
+    metadata["feature_layout"].setdefault("stencil_size", int(stencil_size))
+    metadata["feature_layout"].setdefault("phys_dim", int(phys_dim))
+    metadata["feature_layout"].setdefault(
+        "physics_feature_names",
+        ensure_feature_names(metadata.get("physics_feature_names"), int(phys_dim)),
+    )
+
+
+def _ensure_correction_head_metadata(
+    metadata: Dict[str, Any],
+    *,
+    checkpoint: Dict[str, Any],
+    source_label: str,
+    warn_on_missing: bool,
+) -> None:
+    if "correction_head" in metadata:
+        metadata["correction_head"].setdefault("output_mode", DEFAULT_CORRECTION_HEAD_MODE)
+        metadata["correction_head"].setdefault("output_scale", DEFAULT_CORRECTION_HEAD_SCALE)
+        metadata.setdefault("correction_head_inferred", False)
+        return
+
+    model_cfg = checkpoint.get("config", {}).get("model", {}) if isinstance(checkpoint.get("config", {}), dict) else {}
+    if isinstance(model_cfg.get("correction_head"), dict):
+        metadata["correction_head"] = {
+            "output_mode": str(model_cfg["correction_head"].get("output_mode", DEFAULT_CORRECTION_HEAD_MODE)).lower(),
+            "output_scale": float(model_cfg["correction_head"].get("output_scale", DEFAULT_CORRECTION_HEAD_SCALE)),
+        }
+        metadata["correction_head_inferred"] = True
+        return
+
+    if "shape_output_scale" in model_cfg:
+        if warn_on_missing:
+            _warn(
+                f"{source_label}: correction_head missing, inferring legacy softsign head from model.shape_output_scale."
+            )
+        metadata["correction_head"] = {
+            "output_mode": LEGACY_CORRECTION_HEAD_MODE,
+            "output_scale": float(model_cfg.get("shape_output_scale", LEGACY_CORRECTION_HEAD_SCALE)),
+        }
+        metadata["correction_head_inferred"] = True
+        return
+
+    if warn_on_missing:
+        _warn(f"{source_label}: correction_head missing, using default linear head metadata.")
+    metadata["correction_head"] = default_correction_head_metadata()
+    metadata["correction_head_inferred"] = True

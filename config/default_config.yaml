@@ -33,7 +33,13 @@ model:
   hidden_dim: 32
   shape_grid_size: 10
   shape_spline_order: 3
-  shape_output_scale: 0.5
+  use_stencil_features: true     # 中文：纠正分支默认显式看局部 stencil，减少平滑区污染
+  stencil_radius: 2             # 中文：radius=2 对应 [i-2, ..., i+2]
+  gate_use_stencil_features: false
+  correction_head:
+    output_mode: "linear"       # 中文：默认不再用过窄有界 head，避免激波修正被截断
+    output_scale: 1.0
+  shape_output_scale: null      # 兼容旧配置；若设置则映射为 softsign_scaled
   gate_hidden_dims: [32, 16]
   gate_temperature: 2.0
   gate_bias_init: -1.0
@@ -55,6 +61,9 @@ target_scaler:
 loss:
   smooth_l1_beta: 1.0
   phys_weight_factor: 5.0
+  shock_weight: 5.0
+  smooth_penalty_weight: 2.0e-3
+  locality_penalty_weight: 1.0e-3
   gate_smooth_threshold: 0.1
   gate_separation_margin: 0.05
   gate_sparsity_weight: 2.0e-2
@@ -95,12 +104,39 @@ evaluation:
   N_ref: 2048
   T_final: 1.5
   cfl: 0.4
+  correction_scale: 0.25        # 中文：rollout 默认保守施加修正，便于后续 sweep
   remove_correction_mean: false   # 默认保持与训练一致，不额外去均值
   initial_condition:
     sin1_amp: 1.0
     sin2_amp: 0.5
     sin2_phase: 0.5
     cos5_amp: -0.2
+
+# 诊断/调查报告参数
+analysis:
+  output_dir: "analysis"
+  report_path: "analysis/preliminary_investigation_report.md"
+  summary_json_path: "analysis/preliminary_investigation_summary.json"
+  plot_path: "analysis/preliminary_investigation_plots.png"
+  eval_batch_size: 32768
+  probe_train_points: 60000
+  probe_val_points: 20000
+  probe_epochs: 20
+  probe_batch_size: 4096
+  probe_learning_rate: 1.0e-3
+  time_bucket_edges: [0.0, 0.33, 0.66, 1.0]
+  target_near_zero_epsilon: 1.0e-6
+  sign_probe_quantile: 0.5
+  significant_support_quantile: 0.9
+  shock_feature: "abs_u_x"
+  shock_threshold: null
+  shock_quantile: 0.9
+  transition_threshold: null
+  transition_quantile: 0.75
+  gate_modes: ["train_equivalent", "raw_gate_only", "soft_mask", "hard_mask", "gate_open"]
+  alpha_values: [0.0, 0.25, 0.5, 0.75, 1.0]
+  alpha_gate_mode: "train_equivalent"
+  plot_enabled: true
 
 # 门控消融/推理门控策略
 ablation:

@@ -11,7 +11,18 @@ training:
 optimizer:
   lr: 5.0e-4
 
+model:
+  correction_head:
+    output_mode: "linear"
+    output_scale: 1.0
+  use_stencil_features: true
+  stencil_radius: 2
+  gate_use_stencil_features: false
+
 loss:
+  shock_weight: 6.0
+  smooth_penalty_weight: 3.0e-3
+  locality_penalty_weight: 1.5e-3
   gate_separation_weight: 7.0e-1
   gate_shock_open_weight: 2.0e-1
 
@@ -31,6 +42,7 @@ logging:
 evaluation:
   T_final: 2.0
   cfl: 0.35
+  correction_scale: 0.25
   remove_correction_mean: false
 
 plotting:
