@@ -5,7 +5,19 @@ import numpy as np
 
 
 class KANLinear(nn.Module):
-    def __init__(self, in_features, out_features, grid_size=5, spline_order=3, scale_noise=0.1, scale_base=1.0, scale_spline=1.0, base_activation=torch.nn.SiLU, grid_eps=0.02, grid_range=[-1, 1]):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        grid_size=5,
+        spline_order=3,
+        scale_noise=0.1,
+        scale_base=1.0,
+        scale_spline=1.0,
+        base_activation=torch.nn.SiLU,
+        grid_eps=0.02,
+        grid_range=[-1, 1],
+    ):
         super(KANLinear, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -26,8 +38,11 @@ class KANLinear(nn.Module):
     def reset_parameters(self):
         nn.init.kaiming_uniform_(self.base_weight, a=np.sqrt(5) * self.scale_base)
         with torch.no_grad():
-            noise = (torch.rand(self.grid_size + 1, self.in_features, self.out_features) - 1/2) * self.scale_noise / self.grid_size
-            self.spline_weight.data.copy_((self.scale_spline if self.scale_spline is not None else 1.0) * self.curve2coeff(self.grid.T[self.spline_order : -self.spline_order], noise))
+            noise = (torch.rand(self.grid_size + 1, self.in_features, self.out_features) - 1 / 2) * self.scale_noise / self.grid_size
+            self.spline_weight.data.copy_(
+                (self.scale_spline if self.scale_spline is not None else 1.0)
+                * self.curve2coeff(self.grid.T[self.spline_order : -self.spline_order], noise)
+            )
 
     def b_splines(self, x: torch.Tensor):
         assert x.dim() == 2 and x.size(1) == self.in_features
@@ -67,27 +82,53 @@ class KAN(nn.Module):
 
 
 class GatedKAN(nn.Module):
-    def __init__(self, stencil_size=9, phys_dim=3, hidden_dim=32):
+    def __init__(
+        self,
+        stencil_size=9,
+        phys_dim=3,
+        hidden_dim=32,
+        shape_grid_size=10,
+        shape_spline_order=3,
+        shape_output_scale=0.5,
+        gate_hidden_dims=(32, 16),
+        gate_temperature=2.0,
+        gate_bias_init=-1.0,
+        shock_indicator_threshold=0.15,
+        curvature_eps=1e-4,
+    ):
         super(GatedKAN, self).__init__()
         self.stencil_size = stencil_size
         self.phys_dim = phys_dim
+        self.shape_output_scale = float(shape_output_scale)
+        self.shock_indicator_threshold = float(shock_indicator_threshold)
+        self.curvature_eps = float(curvature_eps)
 
         # Shape Net: full state input.
-        self.shape_net = KAN([stencil_size + phys_dim, hidden_dim, 1], grid_size=10, spline_order=3)
+        self.shape_net = KAN(
+            [stencil_size + phys_dim, hidden_dim, 1],
+            grid_size=shape_grid_size,
+            spline_order=shape_spline_order,
+        )
 
         # Gate gets physics + derived gradient descriptors to avoid early saturation.
         gate_input_dim = phys_dim + 2
-        self.gate_net = nn.Sequential(
-            nn.Linear(gate_input_dim, 32),
-            nn.SiLU(),
-            nn.Linear(32, 16),
-            nn.SiLU(),
-            nn.Linear(16, 1),
-        )
-        self.gate_temperature = 2.0
+        gate_hidden_dims = list(gate_hidden_dims)
+        if len(gate_hidden_dims) == 0:
+            gate_hidden_dims = [16]
 
-        if hasattr(self.gate_net[-1], 'bias'):
-            nn.init.constant_(self.gate_net[-1].bias, -1.0)
+        gate_layers = []
+        last_dim = gate_input_dim
+        for h_dim in gate_hidden_dims:
+            gate_layers.append(nn.Linear(last_dim, int(h_dim)))
+            gate_layers.append(nn.SiLU())
+            last_dim = int(h_dim)
+        gate_layers.append(nn.Linear(last_dim, 1))
+        self.gate_net = nn.Sequential(*gate_layers)
+
+        self.gate_temperature = float(gate_temperature)
+
+        if hasattr(self.gate_net[-1], 'bias') and self.gate_net[-1].bias is not None:
+            nn.init.constant_(self.gate_net[-1].bias, float(gate_bias_init))
 
     def _build_gate_input(self, x_physics):
         if self.phys_dim > 1:
@@ -100,15 +141,15 @@ class GatedKAN(nn.Module):
         else:
             abs_uxx = torch.zeros_like(abs_ux)
 
-        curvature_ratio = abs_uxx / (abs_ux + 1e-4)
-        shock_indicator = F.relu(abs_ux - 0.15)
+        curvature_ratio = abs_uxx / (abs_ux + self.curvature_eps)
+        shock_indicator = F.relu(abs_ux - self.shock_indicator_threshold)
         return torch.cat([x_physics, curvature_ratio, shock_indicator], dim=1)
 
     def forward(self, x):
         x_physics = x[:, self.stencil_size:]
 
         raw_correction = self.shape_net(x)
-        raw_correction = F.softsign(raw_correction) * 0.5
+        raw_correction = F.softsign(raw_correction) * self.shape_output_scale
 
         gate_logits = self.gate_net(self._build_gate_input(x_physics))
         gate = torch.sigmoid(gate_logits / self.gate_temperature)

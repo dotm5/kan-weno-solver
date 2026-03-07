@@ -1,14 +1,59 @@
-import torch
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-import numpy as np
-from sklearn.model_selection import train_test_split
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+import argparse
 import gc
+from pathlib import Path
 
-from kan import GatedKAN, HybridScaler, PhysicsConsistentLoss
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, Dataset
+
+from kan import GatedKAN, HybridScaler
+from utils.config import cfg_get, load_config, set_global_seed
+
+
+class TargetAffineScaler:
+    """Affine target scaler with std floor and z-score clipping for stability."""
+
+    def __init__(self, eps=1e-12, min_std=1e-8, clip_z=8.0):
+        self.eps = eps
+        self.min_std = min_std
+        self.clip_z = clip_z
+        self.mean = 0.0
+        self.std = 1.0
+
+    def fit(self, y):
+        self.mean = float(np.mean(y))
+        raw_std = float(np.std(y))
+        self.std = max(raw_std, self.min_std)
+        if raw_std < self.min_std:
+            print(f"Warning: target std={raw_std:.3e} < min_std={self.min_std:.3e}, using std floor.")
+        return self
+
+    def transform(self, y):
+        z = (y - self.mean) / max(self.std, self.eps)
+        if self.clip_z is not None:
+            z = np.clip(z, -self.clip_z, self.clip_z)
+        return z
+
+    def inverse_transform(self, y):
+        return y * self.std + self.mean
+
+    def state_dict(self):
+        return {
+            "mean": self.mean,
+            "std": self.std,
+            "min_std": self.min_std,
+            "clip_z": self.clip_z,
+        }
+
+    def load_state_dict(self, state):
+        self.mean = float(state.get("mean", 0.0))
+        std = float(state.get("std", 1.0))
+        self.std = max(std, self.min_std)
+        self.min_std = float(state.get("min_std", self.min_std))
+        self.clip_z = state.get("clip_z", self.clip_z)
 
 
 class PDEDataset(Dataset):
@@ -23,119 +68,313 @@ class PDEDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 
-def train(data_path='kan_train_data.npz', epochs=100, batch_size=4096, lr=1e-3, accumulation_steps=4, device=None):
-    device = torch.device(device) if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def _gate_terms(gate, shock_metric, smooth_threshold=0.1, margin=0.05):
+    """Gate regularizers to prevent collapse after target scaling."""
+    smooth_mask = (shock_metric < smooth_threshold).float().unsqueeze(1)
+    shock_mask = 1.0 - smooth_mask
+
+    smooth_count = smooth_mask.sum() + 1e-6
+    shock_count = shock_mask.sum() + 1e-6
+
+    gate_smooth_mean = (gate * smooth_mask).sum() / smooth_count
+    gate_shock_mean = (gate * shock_mask).sum() / shock_count
+
+    sparsity_core = gate_smooth_mean
+    separation_core = F.relu((gate_smooth_mean + margin) - gate_shock_mean)
+    shock_open_core = ((1.0 - gate) * shock_mask).sum() / shock_count
+
+    return gate_smooth_mean, gate_shock_mean, sparsity_core, separation_core, shock_open_core
+
+
+def _resolve_device(runtime_cfg):
+    dev = str(runtime_cfg.get("device", "auto")).lower()
+    if dev == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(dev)
+
+
+def _resolve_auto_flag(value, auto_default):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.lower() == "auto":
+        return auto_default
+    return bool(value)
+
+
+def train_with_config(cfg):
+    runtime_cfg = cfg.get("runtime", {})
+    path_cfg = cfg.get("paths", {})
+    data_cfg = cfg.get("data", {})
+    train_cfg = cfg.get("training", {})
+    opt_cfg = cfg.get("optimizer", {})
+    sched_cfg = cfg.get("scheduler", {})
+    loss_cfg = cfg.get("loss", {})
+    model_cfg = cfg.get("model", {})
+    scaler_cfg = cfg.get("scaler", {})
+    target_scaler_cfg = cfg.get("target_scaler", {})
+
+    set_global_seed(runtime_cfg.get("seed", None), bool(runtime_cfg.get("deterministic", False)))
+
+    device = _resolve_device(runtime_cfg)
     print(f"Using Device: {device}")
 
-    # 1. Load Data
-    data = np.load(data_path)
+    data_path = Path(path_cfg.get("train_data_path", "kan_train_data.npz"))
+    if not data_path.exists():
+        raise FileNotFoundError(f"Training data file not found: {data_path}")
+
+    # 1) Load data
+    data = np.load(str(data_path))
     X = data['X'].astype(np.float32)
     y = data['y'].astype(np.float32)
     stencil_size = int(data['stencil_size'])
     steps_ahead = int(data['steps_ahead'])
     phys_dim = int(X.shape[1] - stencil_size)
 
-    # 2. Split and Scale
-    X_train_raw, X_val_raw, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
-    scaler = HybridScaler(stencil_size=stencil_size)
-    X_train = scaler.fit(X_train_raw).transform(X_train_raw)
-    X_val = scaler.transform(X_val_raw)
+    # 2) Split + scale inputs/targets
+    X_train_raw, X_val_raw, y_train_raw, y_val_raw = train_test_split(
+        X,
+        y,
+        test_size=float(data_cfg.get("split_test_size", 0.2)),
+        random_state=int(data_cfg.get("split_random_state", 42)),
+    )
 
-    train_dataset = PDEDataset(X_train, y_train)
-    val_dataset = PDEDataset(X_val, y_val)
+    input_scaler = HybridScaler(
+        stencil_size=stencil_size,
+        eps=float(scaler_cfg.get("eps", 1e-8)),
+        clip_percentile_abs_features=float(scaler_cfg.get("clip_percentile_abs_features", 99.5)),
+    )
+    X_train = input_scaler.fit(X_train_raw).transform(X_train_raw)
+    X_val = input_scaler.transform(X_val_raw)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=(device.type == 'cuda'), num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=(device.type == 'cuda'), num_workers=0)
+    target_scaler = TargetAffineScaler(
+        eps=float(target_scaler_cfg.get("eps", 1e-12)),
+        min_std=float(target_scaler_cfg.get("min_std", 1e-8)),
+        clip_z=float(target_scaler_cfg.get("clip_z", 8.0)) if target_scaler_cfg.get("clip_z", 8.0) is not None else None,
+    ).fit(y_train_raw)
 
-    # 3. Model & Optimizer
-    model = GatedKAN(stencil_size=stencil_size, phys_dim=phys_dim).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=15, factor=0.5)
-    criterion = PhysicsConsistentLoss()
+    y_train = target_scaler.transform(y_train_raw).astype(np.float32)
+    y_val = target_scaler.transform(y_val_raw).astype(np.float32)
 
-    use_amp = device.type == 'cuda'
+    print(f"Target affine scaling: mean={target_scaler.mean:.3e}, std={target_scaler.std:.3e}, clip_z={target_scaler.clip_z}")
+
+    pin_memory = _resolve_auto_flag(runtime_cfg.get("pin_memory", "auto"), device.type == "cuda")
+    num_workers = int(runtime_cfg.get("num_workers", 0))
+
+    train_loader = DataLoader(
+        PDEDataset(X_train, y_train),
+        batch_size=int(train_cfg.get("batch_size", 4096)),
+        shuffle=True,
+        pin_memory=pin_memory,
+        num_workers=num_workers,
+    )
+    val_loader = DataLoader(
+        PDEDataset(X_val, y_val),
+        batch_size=int(train_cfg.get("batch_size", 4096)),
+        shuffle=False,
+        pin_memory=pin_memory,
+        num_workers=num_workers,
+    )
+
+    # 3) Model + optimizer
+    model = GatedKAN(
+        stencil_size=stencil_size,
+        phys_dim=phys_dim,
+        hidden_dim=int(model_cfg.get("hidden_dim", 32)),
+        shape_grid_size=int(model_cfg.get("shape_grid_size", 10)),
+        shape_spline_order=int(model_cfg.get("shape_spline_order", 3)),
+        shape_output_scale=float(model_cfg.get("shape_output_scale", 0.5)),
+        gate_hidden_dims=tuple(model_cfg.get("gate_hidden_dims", [32, 16])),
+        gate_temperature=float(model_cfg.get("gate_temperature", 2.0)),
+        gate_bias_init=float(model_cfg.get("gate_bias_init", -1.0)),
+        shock_indicator_threshold=float(model_cfg.get("shock_indicator_threshold", 0.15)),
+        curvature_eps=float(model_cfg.get("curvature_eps", 1e-4)),
+    ).to(device)
+
+    if str(opt_cfg.get("type", "adamw")).lower() != "adamw":
+        raise ValueError(f"Unsupported optimizer type: {opt_cfg.get('type')}")
+
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=float(opt_cfg.get("lr", 1e-3)),
+        weight_decay=float(opt_cfg.get("weight_decay", 1e-5)),
+    )
+
+    if str(sched_cfg.get("type", "reduce_on_plateau")).lower() != "reduce_on_plateau":
+        raise ValueError(f"Unsupported scheduler type: {sched_cfg.get('type')}")
+
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode=str(sched_cfg.get("mode", "min")),
+        patience=int(sched_cfg.get("patience", 15)),
+        factor=float(sched_cfg.get("factor", 0.5)),
+    )
+
+    use_amp = _resolve_auto_flag(runtime_cfg.get("use_amp", "auto"), device.type == "cuda")
     grad_scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
     shock_feature_idx = stencil_size + (1 if phys_dim > 1 else 0)
 
-    # 4. Loop
+    target_mean_t = torch.tensor(target_scaler.mean, dtype=torch.float32, device=device)
+    target_std_t = torch.tensor(target_scaler.std, dtype=torch.float32, device=device)
+
+    # 损失相关超参数（从配置读取）
+    smooth_l1_beta = float(loss_cfg.get("smooth_l1_beta", 1.0))
+    smooth_threshold = float(loss_cfg.get("gate_smooth_threshold", 0.1))
+    separation_margin = float(loss_cfg.get("gate_separation_margin", 0.05))
+    gate_sparsity_w = float(loss_cfg.get("gate_sparsity_weight", 2e-2))
+    gate_separation_w = float(loss_cfg.get("gate_separation_weight", 5e-1))
+    gate_shock_open_w = float(loss_cfg.get("gate_shock_open_weight", 1e-1))
+    gate_reg_scale_factor = float(loss_cfg.get("gate_reg_scale_factor", 0.2))
+    gate_reg_scale_min = float(loss_cfg.get("gate_reg_scale_min", 1.0))
+    gate_reg_scale_max = float(loss_cfg.get("gate_reg_scale_max", 25.0))
+    phys_weight_factor = float(loss_cfg.get("phys_weight_factor", 5.0))
+
+    accumulation_steps = int(train_cfg.get("accumulation_steps", 4))
+    grad_clip_norm = float(train_cfg.get("grad_clip_norm", 1.0))
+    log_every = int(train_cfg.get("log_every", 20))
+    epochs = int(train_cfg.get("epochs", 100))
+
+    # 4) Training loop
     for epoch in range(epochs):
         model.train()
-        epoch_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
+
+        train_loss_sum = 0.0
+        train_pred_sum = 0.0
+        train_gate_sep_sum = 0.0
 
         for i, (batch_X, batch_y) in enumerate(train_loader):
             batch_X = batch_X.to(device, non_blocking=True)
             batch_y = batch_y.to(device, non_blocking=True)
+            shock_metric = batch_X[:, shock_feature_idx]
 
             with torch.amp.autocast(device_type='cuda', enabled=use_amp):
-                pred, gate_val = model(batch_X)
-                loss, _, _ = criterion(pred, batch_y, gate_val, batch_X[:, shock_feature_idx])
-                loss = loss / accumulation_steps
+                pred_z, gate = model(batch_X)
+
+                pred_loss = F.smooth_l1_loss(pred_z, batch_y, beta=smooth_l1_beta)
+
+                gate_smooth, gate_shock, sparsity_core, separation_core, shock_open_core = _gate_terms(
+                    gate,
+                    shock_metric,
+                    smooth_threshold=smooth_threshold,
+                    margin=separation_margin,
+                )
+                gate_reg = (
+                    gate_sparsity_w * sparsity_core
+                    + gate_separation_w * separation_core
+                    + gate_shock_open_w * shock_open_core
+                )
+
+                gate_reg_scale = torch.clamp(pred_loss.detach(), min=gate_reg_scale_min, max=gate_reg_scale_max) * gate_reg_scale_factor
+                loss = (pred_loss + gate_reg_scale * gate_reg) / accumulation_steps
 
             grad_scaler.scale(loss).backward()
 
             if (i + 1) % accumulation_steps == 0:
                 grad_scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 grad_scaler.step(optimizer)
                 grad_scaler.update()
                 optimizer.zero_grad(set_to_none=True)
 
-            epoch_loss += loss.item() * accumulation_steps
-            del batch_X, batch_y, pred, gate_val, loss
+            train_loss_sum += loss.item() * accumulation_steps
+            train_pred_sum += pred_loss.item()
+            train_gate_sep_sum += (gate_shock - gate_smooth).item()
 
-        # Validation
+            del batch_X, batch_y, shock_metric, pred_z, gate, pred_loss, gate_smooth, gate_shock, sparsity_core, separation_core, shock_open_core, gate_reg, gate_reg_scale, loss
+
+        # 5) Validation
         model.eval()
-        val_mse_sum = 0.0
-        gate_smooth_sum = 0.0
-        gate_shock_sum = 0.0
-        smooth_count = 0.0
-        shock_count = 0.0
+        val_pred_sum = 0.0
+        val_phys_wmse_sum = 0.0
+        val_gate_sep_sum = 0.0
+        batch_count = 0
 
         with torch.no_grad(), torch.amp.autocast(device_type='cuda', enabled=use_amp):
             for batch_X, batch_y in val_loader:
                 batch_X = batch_X.to(device, non_blocking=True)
                 batch_y = batch_y.to(device, non_blocking=True)
-
-                pred, gate = model(batch_X)
-                weights = 1.0 + 5.0 * torch.abs(batch_y)
-                mse = torch.mean(weights * (pred - batch_y)**2)
-                val_mse_sum += mse.item() * batch_X.size(0)
-
                 shock_metric = batch_X[:, shock_feature_idx]
-                smooth_mask = (shock_metric < 0.1).float()
-                shock_mask = 1.0 - smooth_mask
 
-                gate_smooth_sum += torch.sum(gate * smooth_mask).item()
-                smooth_count += torch.sum(smooth_mask).item()
-                gate_shock_sum += torch.sum(gate * shock_mask).item()
-                shock_count += torch.sum(shock_mask).item()
+                pred_z, gate = model(batch_X)
+                pred_loss = F.smooth_l1_loss(pred_z, batch_y, beta=smooth_l1_beta)
+                val_pred_sum += pred_loss.item() * batch_X.size(0)
 
-                del batch_X, batch_y, pred, gate, weights, mse, shock_metric, smooth_mask, shock_mask
+                pred_phys = pred_z * target_std_t + target_mean_t
+                target_phys = batch_y * target_std_t + target_mean_t
+                weights = 1.0 + phys_weight_factor * torch.abs(target_phys)
+                wmse_phys = torch.mean(weights * (pred_phys - target_phys) ** 2)
+                val_phys_wmse_sum += wmse_phys.item() * batch_X.size(0)
 
-        avg_val_mse = val_mse_sum / len(val_dataset)
-        mean_gate_smooth = gate_smooth_sum / (smooth_count + 1e-6)
-        mean_gate_shock = gate_shock_sum / (shock_count + 1e-6)
+                gate_smooth, gate_shock, _, _, _ = _gate_terms(
+                    gate,
+                    shock_metric,
+                    smooth_threshold=smooth_threshold,
+                    margin=separation_margin,
+                )
+                val_gate_sep_sum += (gate_shock - gate_smooth).item() * batch_X.size(0)
+                batch_count += batch_X.size(0)
 
-        scheduler.step(avg_val_mse)
+                del batch_X, batch_y, shock_metric, pred_z, gate, pred_loss, pred_phys, target_phys, weights, wmse_phys, gate_smooth, gate_shock
 
-        if epoch % 20 == 0:
-            print(f"Epoch {epoch:3d} | Loss: {epoch_loss/len(train_loader):.1e} | Val W-MSE: {avg_val_mse:.1e} | Gate Sep: {mean_gate_shock-mean_gate_smooth:.3f}")
+        avg_train_loss = train_loss_sum / max(len(train_loader), 1)
+        avg_train_pred = train_pred_sum / max(len(train_loader), 1)
+        avg_train_gate_sep = train_gate_sep_sum / max(len(train_loader), 1)
+
+        avg_val_pred = val_pred_sum / max(batch_count, 1)
+        avg_val_phys_wmse = val_phys_wmse_sum / max(batch_count, 1)
+        avg_val_gate_sep = val_gate_sep_sum / max(batch_count, 1)
+
+        scheduler.step(avg_val_pred)
+
+        if epoch % log_every == 0:
+            print(
+                f"Epoch {epoch:3d} | Loss(total): {avg_train_loss:.2e} | Pred(z): {avg_train_pred:.2e} | "
+                f"Val Pred(z): {avg_val_pred:.2e} | Val W-MSE(phys): {avg_val_phys_wmse:.2e} | "
+                f"Gate Sep train/val: {avg_train_gate_sep:.3f}/{avg_val_gate_sep:.3f}"
+            )
 
         if device.type == 'cuda':
             torch.cuda.empty_cache()
         gc.collect()
 
-    # 5. Save
-    torch.save({
+    # 6) Save
+    save_target_scaler = bool(cfg_get(cfg, "checkpoint.save_target_scaler", True))
+    save_dict = {
         'model_state_dict': model.state_dict(),
-        'scaler_state': scaler.state_dict(),
+        'scaler_state': input_scaler.state_dict(),
         'stencil_size': stencil_size,
         'phys_dim': phys_dim,
-        'steps_ahead': steps_ahead
-    }, 'kan_model.pth')
-    print("Model saved to 'kan_model.pth'")
+        'steps_ahead': steps_ahead,
+        'config': cfg,
+    }
+    if save_target_scaler:
+        save_dict['target_scaler_state'] = target_scaler.state_dict()
+
+    model_save_path = Path(path_cfg.get("model_save_path", "kan_model.pth"))
+    torch.save(save_dict, str(model_save_path))
+    print(f"Model saved to '{model_save_path}'")
+
+
+def train(data_path='kan_train_data.npz', epochs=100, batch_size=4096, lr=1e-3, accumulation_steps=4, device=None):
+    """向后兼容入口：保留旧签名，内部转为配置驱动。"""
+    cfg = load_config(None)
+    cfg['paths']['train_data_path'] = data_path
+    cfg['training']['epochs'] = epochs
+    cfg['training']['batch_size'] = batch_size
+    cfg['optimizer']['lr'] = lr
+    cfg['training']['accumulation_steps'] = accumulation_steps
+    if device is not None:
+        cfg['runtime']['device'] = str(device)
+    return train_with_config(cfg)
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Train Hybrid WENO5-KAN model.")
+    parser.add_argument("--config", type=str, default=None, help="配置文件路径（可选）")
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    train()
+    args = _parse_args()
+    cfg = load_config(args.config)
+    train_with_config(cfg)

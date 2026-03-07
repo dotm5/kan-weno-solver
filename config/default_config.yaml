@@ -1,0 +1,151 @@
+# 项目基础配置（默认）
+project:
+  name: "hybrid_weno5_kan"
+
+# 路径相关
+paths:
+  train_data_path: "kan_train_data.npz"
+  model_save_path: "kan_model.pth"
+  evaluation_plot_path: "evaluation_result.png"
+  data_output_path: "kan_train_data.npz"
+
+# 运行时设置
+runtime:
+  device: "auto"          # auto/cpu/cuda
+  seed: 42
+  deterministic: false
+  num_workers: 0
+  pin_memory: "auto"      # auto/true/false
+  use_amp: "auto"         # auto/true/false
+
+# 数据切分与加载
+data:
+  split_test_size: 0.2
+  split_random_state: 42
+
+# 数值求解器参数（WENO5 + RK3）
+solver:
+  nu: 0.0
+  weno_epsilon: 1.0e-6
+
+# 模型结构参数
+model:
+  hidden_dim: 32
+  shape_grid_size: 10
+  shape_spline_order: 3
+  shape_output_scale: 0.5
+  gate_hidden_dims: [32, 16]
+  gate_temperature: 2.0
+  gate_bias_init: -1.0
+  shock_indicator_threshold: 0.15
+  curvature_eps: 1.0e-4
+
+# 特征缩放参数
+scaler:
+  eps: 1.0e-8
+  clip_percentile_abs_features: 99.5
+
+# 目标仿射归一化
+target_scaler:
+  eps: 1.0e-12
+  min_std: 1.0e-8
+  clip_z: 8.0
+
+# 损失与门控正则
+loss:
+  smooth_l1_beta: 1.0
+  phys_weight_factor: 5.0
+  gate_smooth_threshold: 0.1
+  gate_separation_margin: 0.05
+  gate_sparsity_weight: 2.0e-2
+  gate_separation_weight: 5.0e-1
+  gate_shock_open_weight: 1.0e-1
+  gate_reg_scale_factor: 0.2
+  gate_reg_scale_min: 1.0
+  gate_reg_scale_max: 25.0
+
+# 优化器参数
+optimizer:
+  type: "adamw"
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+
+# 学习率调度器
+scheduler:
+  type: "reduce_on_plateau"
+  mode: "min"
+  patience: 15
+  factor: 0.5
+
+# 训练超参数
+training:
+  epochs: 100
+  batch_size: 4096
+  accumulation_steps: 4
+  grad_clip_norm: 1.0
+  log_every: 20
+
+# 评估与验证相关
+validation:
+  enabled: true
+
+# Rollout/评估参数
+evaluation:
+  N_coarse: 128
+  N_ref: 2048
+  T_final: 1.5
+  cfl: 0.4
+  remove_correction_mean: true
+  initial_condition:
+    sin1_amp: 1.0
+    sin2_amp: 0.5
+    sin2_phase: 0.5
+    cos5_amp: -0.2
+
+# 门控消融/推理门控策略
+ablation:
+  gate_mode: "soft_mask"   # original/raw_gate_only/gate_open/soft_mask
+  hard_gate_sensor_threshold: 0.1
+  soft_mask_center: 0.1
+  soft_mask_width: 0.08
+  soft_mask_floor: 0.02
+  correction_clip_abs: null
+  correction_sign_mode: "auto"   # auto/plus/minus
+
+# 日志与调试输出
+logging:
+  debug_rollout: false
+  debug_t_start: 1.0
+  debug_sign_metrics: false
+  debug_gate_metrics: false
+
+# 绘图参数
+plotting:
+  enabled: true
+  figsize: [10, 8]
+  dpi: 120
+  gate_ylim: [-0.02, 1.02]
+  l2_yscale: "log"
+
+# 检查点保存参数
+checkpoint:
+  save_target_scaler: true
+
+# 数据生成设置
+data_generation:
+  num_samples: 5000
+  N_coarse: 128
+  N_fine: 2048
+  steps_ahead: 10
+  stencil_size: 9
+  cfl: 0.5
+  num_sessions: 64
+  sample_stride: 1
+  seed: null
+  num_modes: 6
+  amplitude_min: 0.1
+  amplitude_max: 1.0
+  amplitude_decay_power: 1.0
+  warmup_factor: 4
+  max_rollout_factor: 3
+  progress_bar_width: 30

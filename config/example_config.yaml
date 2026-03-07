@@ -1,0 +1,40 @@
+# 示例实验配置：只覆盖你关心的字段
+runtime:
+  seed: 42
+  device: "cuda"
+
+training:
+  epochs: 150
+  batch_size: 2048
+  log_every: 10
+
+optimizer:
+  lr: 5.0e-4
+
+loss:
+  gate_separation_weight: 7.0e-1
+  gate_shock_open_weight: 2.0e-1
+
+# 评估时门控消融设置
+ablation:
+  gate_mode: "raw_gate_only"
+  hard_gate_sensor_threshold: 0.08
+  soft_mask_width: 0.12
+
+logging:
+  debug_rollout: true
+  debug_t_start: 0.9
+
+evaluation:
+  T_final: 2.0
+  cfl: 0.35
+
+plotting:
+  dpi: 150
+
+# 数据生成参数（可单独用于 python -m data.generate）
+data_generation:
+  num_samples: 8000
+  num_sessions: 96
+  sample_stride: 2
+  seed: 2026

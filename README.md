@@ -1,92 +1,131 @@
 # Hybrid WENO5-KAN Solver for Burgers' Equation
 
-This project implements a **hybrid numerical solver** that integrates the high-order **WENO5** (Weighted Essential Non-Oscillatory) scheme with **Gated Kolmogorov-Arnold Networks (Gated KAN)**.
+Hybrid solver for 1D Burgers' equation:
+- numerical backbone: WENO5 + Lax-Friedrichs + TVD-RK3
+- learned correction: Gated KAN
+- objective: keep smooth-region stability while activating correction in shock-relevant regions
 
-The hybrid approach uses KAN to learn and correct numerical truncation errors on coarse grids, achieving high-resolution fidelity with significantly lower computational overhead.
+## What Changed (Current Workflow)
 
-## 🚀 Key Features
+- YAML-first configuration system:
+  - default: `config/default_config.yaml`
+  - override: `--config config/xxx.yaml` (recursive merge on top of default)
+- Gate pipeline improvements:
+  - richer gate features (time embedding + gradient descriptors)
+  - configurable gate inference modes: `original`, `raw_gate_only`, `gate_open`, `soft_mask`
+  - rollout diagnostics for `raw_gate`, `effective_gate`, `mask_active_ratio`, correction magnitude
+- Target Affine Scaling:
+  - train in normalized target space (`N(0,1)`-like)
+  - inverse-transform during evaluation to physical correction scale
+  - scaler state saved to checkpoint (`target_scaler_state`)
+- Data generation upgrade:
+  - single-session -> multi-session sampling
+  - rolling progress bar + ETA in `data/generate.py`
 
-*   **Core Physics Engine**: Vectorized WENO5 implementation with Lax-Friedrichs flux splitting and TVD-RK3 time integration.
-*   **Gated KAN Architecture (v4.1)**: A physics-gated network that dynamically applies corrections based on local flow gradients and shock metrics.
-*   **Physics-Consistent Learning**: A custom loss function incorporating shock-weighting and sparsity constraints to ensure stability near discontinuities.
-*   **Modular Design**: Clean separation between the neural network core, numerical solvers, data pipelines, and testing suites.
-
----
-
-## 📂 Project Structure
+## Project Structure
 
 ```text
 .
-├── kan/                   # Neural Network Package
-│   ├── model.py           # Gated KAN & KANLinear definitions
-│   ├── scalers.py         # Physics-aware HybridScaler
-│   └── losses.py          # Physics-Consistent Loss functions
-├── solvers/               # Numerical Physics Solvers
-│   └── weno.py            # WENO5 + RK3 implementation
-├── data/                  # Data Generation Pipeline
-│   └── generate.py        # High-fidelity data generation logic
-├── tests/                 # Professional Test Suite
-│   ├── conftest.py        # Shared pytest fixtures
-│   ├── test_baseline.py   # Solver accuracy & conservation tests
-│   ├── test_dataset.py    # Data integrity tests
-│   ├── test_training.py   # Model convergence & I/O tests
-│   └── convergence.py     # WENO5 order-of-accuracy verification
-├── train.py               # Unified training entry point
-├── evaluate.py            # Performance evaluation & ablation study
-├── dev_log.md             # Development history (Chinese)
-└── requirements.txt       # Project dependencies
+├── config/
+│   ├── default_config.yaml      # 默认完整配置（含中文注释）
+│   └── example_config.yaml      # 只覆盖部分字段的示例
+├── data/
+│   └── generate.py              # 多会话数据生成 + 进度条/ETA
+├── kan/
+│   ├── model.py                 # Gated KAN / gate 输入构造
+│   ├── scalers.py               # HybridScaler
+│   └── losses.py
+├── solvers/
+│   └── weno.py                  # WENO5 + RK3
+├── utils/
+│   └── config.py                # YAML 加载、递归合并、seed
+├── train.py                     # 配置驱动训练
+├── evaluate.py                  # 配置驱动 rollout + 诊断绘图
+├── rollout.py                   # evaluate 包装入口
+├── dev_log.md                   # 开发日志
+└── requirements.txt
 ```
 
----
+## Installation
 
-## 🛠️ Quick Start
-
-### 1. Installation
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Workflow
+## End-to-End Workflow
 
-**Step 1: Generate Training Data**
-Generate accumulated error data (Truth vs. Baseline) using a 9-point stencil.
+1. Inspect/prepare config
 ```bash
-python -m data.generate
-```
-
-**Step 2: Train the Model**
-Train the Gated KAN model using the physics-consistent loss.
-```bash
+# 使用默认配置
 python train.py
+
+# 使用自定义覆盖配置
+python train.py --config config/example_config.yaml
 ```
 
-**Step 3: Evaluate Performance**
-Run a full rollout simulation to compare Baseline WENO5 vs. Hybrid WENO5-KAN.
+2. Generate dataset (multi-session)
 ```bash
-python evaluate.py
+# 默认配置生成
+python -m data.generate
+
+# 自定义配置生成
+python -m data.generate --config config/example_config.yaml
 ```
 
----
-
-## 🧪 Testing
-
-The project uses `pytest` for quality assurance. The suite covers numerical conservation, model convergence, and data integrity.
-
-Run all tests:
+3. Train
 ```bash
-pytest
+python train.py --config config/example_config.yaml
 ```
 
-Run convergence verification:
+4. Evaluate / rollout
 ```bash
+python evaluate.py --config config/example_config.yaml
+# 或
+python rollout.py --config config/example_config.yaml
+```
+
+## Gate Evaluation / Ablation Workflow
+
+Configure `ablation.gate_mode` in YAML:
+- `original`: `effective_gate = raw_gate * hard_mask`
+- `raw_gate_only`: `effective_gate = raw_gate`
+- `gate_open`: `effective_gate = 1`
+- `soft_mask` (default): `effective_gate = raw_gate * soft_mask`
+
+Useful debug options:
+- `logging.debug_rollout: true`
+- `logging.debug_t_start: 1.0`
+
+When debug is enabled, evaluation logs:
+- raw/effective gate stats
+- mask active ratio
+- shock indicator stats
+- correction magnitude vs baseline update magnitude
+
+Plot output (`paths.evaluation_plot_path`) includes:
+- top panel: baseline vs hybrid L2 error
+- bottom panel: raw/effective gate, mask ratio, correction magnitude
+
+## Data Features
+
+Current physics feature vector:
+
+```text
+[u_x, |u_x|, |u_xx|, grad_var, dt, sin(t), cos(t)]
+```
+
+## Checkpoint Contents
+
+Saved by `train.py`:
+- `model_state_dict`
+- `scaler_state` (input scaler)
+- `target_scaler_state` (target affine scaler, if enabled)
+- `stencil_size`, `phys_dim`, `steps_ahead`
+- `config` snapshot
+
+## Testing
+
+```bash
+python -m pytest
 python -m tests.convergence
 ```
-
----
-
-## 📈 Results
-
-The **Gated KAN** model effectively identifies shock regions and applies localized corrections. This results in:
-1.  **Reduced Numerical Dissipation**: Sharper shock fronts compared to standard coarse-grid WENO5.
-2.  **Phase Error Correction**: Improved wave propagation speed accuracy over long-term integration.
-3.  **Physical Consistency**: The gating mechanism ensures corrections are suppressed in smooth regions where the baseline solver is already accurate.

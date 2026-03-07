@@ -3,10 +3,11 @@ from sklearn.preprocessing import StandardScaler
 
 
 class HybridScaler:
-    def __init__(self, stencil_size=9):
+    def __init__(self, stencil_size=9, eps=1e-8, clip_percentile_abs_features=99.5):
         self.stencil_size = stencil_size
         self.stencil_scaler = StandardScaler()
-        self.eps = 1e-8
+        self.eps = eps
+        self.clip_percentile_abs_features = float(clip_percentile_abs_features)
 
         self.phys_dim = 0
         self.phys_mean = np.zeros(0, dtype=np.float32)
@@ -33,7 +34,7 @@ class HybridScaler:
                 self.phys_mean[idx] = float(np.mean(col))
                 self.phys_std[idx] = float(np.std(col) + self.eps)
             elif idx in (1, 2, 3):
-                self.phys_upper[idx] = float(np.percentile(col, 99.5) + self.eps)
+                self.phys_upper[idx] = float(np.percentile(col, self.clip_percentile_abs_features) + self.eps)
                 self.phys_use_clip[idx] = True
             elif idx == 4:
                 self.phys_upper[idx] = float(np.max(col) + self.eps)
@@ -80,6 +81,8 @@ class HybridScaler:
             'phys_std': self.phys_std,
             'phys_upper': self.phys_upper,
             'phys_use_clip': self.phys_use_clip,
+            'eps': self.eps,
+            'clip_percentile_abs_features': self.clip_percentile_abs_features,
         }
 
     def load_state_dict(self, state):
@@ -87,6 +90,11 @@ class HybridScaler:
         self.stencil_scaler.scale_ = state['stencil_scale']
         self.stencil_scaler.var_ = state['stencil_scale'] ** 2
         self.stencil_scaler.n_features_in_ = len(state['stencil_mean'])
+
+        self.eps = float(state.get('eps', self.eps))
+        self.clip_percentile_abs_features = float(
+            state.get('clip_percentile_abs_features', self.clip_percentile_abs_features)
+        )
 
         if 'phys_dim' in state:
             self.phys_dim = int(state['phys_dim'])
