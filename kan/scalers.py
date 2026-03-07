@@ -1,77 +1,107 @@
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 
+
 class HybridScaler:
     def __init__(self, stencil_size=9):
         self.stencil_size = stencil_size
         self.stencil_scaler = StandardScaler()
-        # Physics Params
-        self.phys_ux_mean = 0.0
-        self.phys_ux_std = 1.0
-        self.phys_abs_max = 1.0
-        self.phys_dt_max = 1.0
+        self.eps = 1e-8
+
+        self.phys_dim = 0
+        self.phys_mean = np.zeros(0, dtype=np.float32)
+        self.phys_std = np.ones(0, dtype=np.float32)
+        self.phys_upper = np.ones(0, dtype=np.float32)
+        self.phys_use_clip = np.zeros(0, dtype=bool)
 
     def fit(self, X):
-        """只在训练集上调用"""
-        # 1. Stencil (Standardization)
+        """Fit on train split only."""
         X_stencil = X[:, :self.stencil_size]
         self.stencil_scaler.fit(X_stencil)
-        
-        # 2. Physics: [u_x, |u_x|, dt]
-        u_x = X[:, self.stencil_size]
-        abs_ux = X[:, self.stencil_size+1]
-        dt = X[:, self.stencil_size+2]
-        
-        # u_x: 有正有负，用均值方差归一化
-        self.phys_ux_mean = np.mean(u_x)
-        self.phys_ux_std = np.std(u_x) + 1e-8
-        
-        # [Critical Upgrade] |u_x|: 使用 99.9 分位数而不是 Max
-        # 防止个别极端激波导致大部分数据被压缩到 0
-        self.phys_abs_max = np.percentile(abs_ux, 99.9) + 1e-8
-        
-        # dt: 使用 Max (dt 通常是离散的几个值，Max 没问题)
-        self.phys_dt_max = np.max(dt) + 1e-8
-        
-        print(f"Scaler Fitted: |u_x| max clip threshold = {self.phys_abs_max:.4f}")
+
+        X_phys = X[:, self.stencil_size:]
+        self.phys_dim = X_phys.shape[1]
+
+        self.phys_mean = np.zeros(self.phys_dim, dtype=np.float32)
+        self.phys_std = np.ones(self.phys_dim, dtype=np.float32)
+        self.phys_upper = np.ones(self.phys_dim, dtype=np.float32)
+        self.phys_use_clip = np.zeros(self.phys_dim, dtype=bool)
+
+        for idx in range(self.phys_dim):
+            col = X_phys[:, idx]
+            if idx == 0:
+                self.phys_mean[idx] = float(np.mean(col))
+                self.phys_std[idx] = float(np.std(col) + self.eps)
+            elif idx in (1, 2, 3):
+                self.phys_upper[idx] = float(np.percentile(col, 99.5) + self.eps)
+                self.phys_use_clip[idx] = True
+            elif idx == 4:
+                self.phys_upper[idx] = float(np.max(col) + self.eps)
+                self.phys_use_clip[idx] = True
+            elif idx in (5, 6):
+                # sin/cos timestamp embedding is already bounded.
+                pass
+            else:
+                self.phys_mean[idx] = float(np.mean(col))
+                self.phys_std[idx] = float(np.std(col) + self.eps)
+
+        if self.phys_dim > 1:
+            print(f"Scaler Fitted: |u_x| clip threshold = {self.phys_upper[1]:.4f}")
         return self
 
     def transform(self, X):
-        """应用变换"""
         X_stencil = X[:, :self.stencil_size]
         X_stencil_norm = self.stencil_scaler.transform(X_stencil)
-        
-        u_x = X[:, self.stencil_size]
-        abs_ux = X[:, self.stencil_size+1]
-        dt = X[:, self.stencil_size+2]
-        
-        u_x_norm = (u_x - self.phys_ux_mean) / self.phys_ux_std
-        
-        # 这里的 clip 很重要，防止推理时出现比训练集还大的极端值
-        abs_ux_norm = np.clip(abs_ux / self.phys_abs_max, 0.0, 1.0)
-        dt_norm = dt / self.phys_dt_max
-        
-        X_phys_norm = np.stack([u_x_norm, abs_ux_norm, dt_norm], axis=1)
+
+        X_phys = X[:, self.stencil_size:]
+        if X_phys.shape[1] != self.phys_dim:
+            raise ValueError(
+                f"Physics feature dim mismatch: got {X_phys.shape[1]}, expected {self.phys_dim}."
+            )
+
+        X_phys_norm = np.empty_like(X_phys, dtype=np.float32)
+        for idx in range(self.phys_dim):
+            col = X_phys[:, idx]
+            if self.phys_use_clip[idx]:
+                X_phys_norm[:, idx] = np.clip(col / self.phys_upper[idx], 0.0, 1.0)
+            elif idx in (5, 6):
+                X_phys_norm[:, idx] = np.clip(col, -1.0, 1.0)
+            else:
+                X_phys_norm[:, idx] = (col - self.phys_mean[idx]) / self.phys_std[idx]
+
         return np.hstack([X_stencil_norm, X_phys_norm])
 
     def state_dict(self):
         return {
             'stencil_mean': self.stencil_scaler.mean_,
             'stencil_scale': self.stencil_scaler.scale_,
-            'phys_params': (self.phys_ux_mean, self.phys_ux_std, self.phys_abs_max, self.phys_dt_max)
+            'phys_dim': int(self.phys_dim),
+            'phys_mean': self.phys_mean,
+            'phys_std': self.phys_std,
+            'phys_upper': self.phys_upper,
+            'phys_use_clip': self.phys_use_clip,
         }
 
     def load_state_dict(self, state):
-        """[关键] 从保存的参数中恢复"""
         self.stencil_scaler.mean_ = state['stencil_mean']
         self.stencil_scaler.scale_ = state['stencil_scale']
-        # Sklearn 的 StandardScaler 需要设定 var_ 才能正常工作，虽然 transform 用不到
-        if hasattr(self.stencil_scaler, 'var_') or True:
-             self.stencil_scaler.var_ = state['stencil_scale'] ** 2 
-        
-        params = state['phys_params']
-        self.phys_ux_mean = params[0]
-        self.phys_ux_std = params[1]
-        self.phys_abs_max = params[2]
-        self.phys_dt_max = params[3]
-        print(f"Scaler Loaded. |u_x| max threshold: {self.phys_abs_max:.4f}")
+        self.stencil_scaler.var_ = state['stencil_scale'] ** 2
+        self.stencil_scaler.n_features_in_ = len(state['stencil_mean'])
+
+        if 'phys_dim' in state:
+            self.phys_dim = int(state['phys_dim'])
+            self.phys_mean = np.asarray(state['phys_mean'], dtype=np.float32)
+            self.phys_std = np.asarray(state['phys_std'], dtype=np.float32)
+            self.phys_upper = np.asarray(state['phys_upper'], dtype=np.float32)
+            self.phys_use_clip = np.asarray(state['phys_use_clip'], dtype=bool)
+        else:
+            # Backward compatibility for old checkpoints with 3 physics features.
+            ux_mean, ux_std, abs_max, dt_max = state['phys_params']
+            self.phys_dim = 3
+            self.phys_mean = np.array([ux_mean, 0.0, 0.0], dtype=np.float32)
+            self.phys_std = np.array([ux_std, 1.0, 1.0], dtype=np.float32)
+            self.phys_upper = np.array([1.0, abs_max, dt_max], dtype=np.float32)
+            self.phys_use_clip = np.array([False, True, True], dtype=bool)
+
+        if self.phys_dim > 1:
+            print(f"Scaler Loaded. |u_x| clip threshold: {self.phys_upper[1]:.4f}")

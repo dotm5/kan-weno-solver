@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+
 class KANLinear(nn.Module):
     def __init__(self, in_features, out_features, grid_size=5, spline_order=3, scale_noise=0.1, scale_base=1.0, scale_spline=1.0, base_activation=torch.nn.SiLU, grid_eps=0.02, grid_range=[-1, 1]):
         super(KANLinear, self).__init__()
@@ -51,48 +52,65 @@ class KANLinear(nn.Module):
         spline_output = F.linear(self.b_splines(x).view(x.size(0), -1), self.spline_weight.view(self.out_features, -1))
         return base_output + spline_output
 
+
 class KAN(nn.Module):
     def __init__(self, layers_hidden, grid_size=5, spline_order=3):
         super(KAN, self).__init__()
         self.layers = nn.ModuleList()
         for in_features, out_features in zip(layers_hidden, layers_hidden[1:]):
             self.layers.append(KANLinear(in_features, out_features, grid_size=grid_size, spline_order=spline_order))
+
     def forward(self, x):
         for layer in self.layers:
             x = layer(x)
         return x
+
 
 class GatedKAN(nn.Module):
     def __init__(self, stencil_size=9, phys_dim=3, hidden_dim=32):
         super(GatedKAN, self).__init__()
         self.stencil_size = stencil_size
         self.phys_dim = phys_dim
-        
-        # Shape Net: 全状态输入
+
+        # Shape Net: full state input.
         self.shape_net = KAN([stencil_size + phys_dim, hidden_dim, 1], grid_size=10, spline_order=3)
-        
-        # Gate Net: 物理门控
+
+        # Gate gets physics + derived gradient descriptors to avoid early saturation.
+        gate_input_dim = phys_dim + 2
         self.gate_net = nn.Sequential(
-            nn.Linear(phys_dim, 16),
+            nn.Linear(gate_input_dim, 32),
             nn.SiLU(),
-            nn.Linear(16, 16),
+            nn.Linear(32, 16),
             nn.SiLU(),
             nn.Linear(16, 1),
-            nn.Sigmoid()
         )
-        # 初始化 Gate 偏置为 -2.0 (Gate ≈ 0.12)
-        if hasattr(self.gate_net[-2], 'bias'):
-             nn.init.constant_(self.gate_net[-2].bias, -2.0)
+        self.gate_temperature = 2.0
+
+        if hasattr(self.gate_net[-1], 'bias'):
+            nn.init.constant_(self.gate_net[-1].bias, -1.0)
+
+    def _build_gate_input(self, x_physics):
+        if self.phys_dim > 1:
+            abs_ux = x_physics[:, 1:2]
+        else:
+            abs_ux = torch.abs(x_physics[:, 0:1])
+
+        if self.phys_dim > 2:
+            abs_uxx = x_physics[:, 2:3]
+        else:
+            abs_uxx = torch.zeros_like(abs_ux)
+
+        curvature_ratio = abs_uxx / (abs_ux + 1e-4)
+        shock_indicator = F.relu(abs_ux - 0.15)
+        return torch.cat([x_physics, curvature_ratio, shock_indicator], dim=1)
 
     def forward(self, x):
-        x_stencil = x[:, :self.stencil_size]
         x_physics = x[:, self.stencil_size:]
-        
-        raw_correction = self.shape_net(x) 
-        
-        # Softsign 限幅
+
+        raw_correction = self.shape_net(x)
         raw_correction = F.softsign(raw_correction) * 0.5
-        
-        gate = self.gate_net(x_physics)
-        
+
+        gate_logits = self.gate_net(self._build_gate_input(x_physics))
+        gate = torch.sigmoid(gate_logits / self.gate_temperature)
+
         return raw_correction * gate, gate
