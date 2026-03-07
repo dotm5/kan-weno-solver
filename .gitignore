@@ -1,17 +1,54 @@
-# Python 缓存
+# === Python Artifacts ===
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+.ipynb_checkpoints
 
-#本地日志
+# === Build & Distribution ===
+build/
+dist/
+temp/
+*.egg-info/
+.eggs/
 
-12.md
+# === Environment & Secrets ===
+.env
+.venv/
+env/
+venv/
+ENV/
 
-# 数据集和模型 (太大了，不要提交)
+# === Testing & Coverage ===
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# === IDE & OS ===
+.vscode/
+.idea/
+.project
+.pydevproject
+.settings/
+.DS_Store
+Thumbs.db
+
+# === Project Specific Artifacts ===
+# Dataset and Model weights (Large files)
 *.npz
 *.pth
+*.pth.tar
 
-# IDE 配置
-.vscode/
+# Logs and Temporary files
+*.log
+*.tmp
+*.bak
+out.log
+err.log
 
-# 图片结果 (可选，如果你想保留图片可以去掉这行)
-*.png
+# Visualization results (Optional: uncomment if you want to track them)
+# *.png
+# *.pdf
+# *.svg

@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, "refactor/**", "feature/**" ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: CPU Tests
+    runs-on: ubuntu-latest
+    env:
+      CUDA_VISIBLE_DEVICES: ""
+      PYTHONPATH: .
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v3
+
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+        cache: 'pip'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        # Install requirements
+        pip install -r requirements.txt
+        # Install test-specific tools
+        pip install pytest pytest-cov
+
+    - name: Force CPU Verification
+      run: |
+        python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); assert not torch.cuda.is_available(), 'CUDA should not be available in CI'"
+
+    - name: Run Pytest
+      run: |
+        # Run lightweight tests with coverage
+        pytest -v tests/test_basic.py --cov=. --cov-report=term-missing
+
+    - name: Run Full Pipeline Smoke Test
+      run: |
+        # Run Dataset Generation -> Training -> Evaluation
+        python ci_smoke_test.py
+
+    - name: Check Artifacts Cleanup
+      run: |
+        # Verify no large files were left behind
+        # Note: ci_smoke_test.py might leave kan_model.pth if not manually cleaned in script, 
+        # but we check if it exists to know the pipeline worked, then we can clean it.
+        if [ ! -f "kan_model.pth" ]; then echo "Artifact kan_model.pth MISSING!"; exit 1; fi
+        if [ ! -f "kan_train_data.npz" ]; then echo "Artifact kan_train_data.npz MISSING!"; exit 1; fi
+        rm -f kan_model.pth kan_train_data.npz evaluation_result.png

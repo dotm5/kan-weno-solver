@@ -1,67 +1,131 @@
 # Hybrid WENO5-KAN Solver for Burgers' Equation
 
-This project implements a **hybrid numerical solver** that integrates the high-order **WENO5** (Weighted Essential Non-Oscillatory) scheme with **Kolmogorov-Arnold Networks (KAN)**.
+Hybrid solver for 1D Burgers' equation:
+- numerical backbone: WENO5 + Lax-Friedrichs + TVD-RK3
+- learned correction: Gated KAN
+- objective: keep smooth-region stability while activating correction in shock-relevant regions
 
-The goal is to use KAN to learn and correct the truncation errors of the WENO5 solver on coarse grids, effectively achieving high-resolution accuracy with low-resolution computational cost.
+## What Changed (Current Workflow)
 
-## Key Features
+- YAML-first configuration system:
+  - default: `config/default_config.yaml`
+  - override: `--config config/xxx.yaml` (recursive merge on top of default)
+- Gate pipeline improvements:
+  - richer gate features (time embedding + gradient descriptors)
+  - configurable gate inference modes: `original`, `raw_gate_only`, `gate_open`, `soft_mask`
+  - rollout diagnostics for `raw_gate`, `effective_gate`, `mask_active_ratio`, correction magnitude
+- Target Affine Scaling:
+  - train in normalized target space (`N(0,1)`-like)
+  - inverse-transform during evaluation to physical correction scale
+  - scaler state saved to checkpoint (`target_scaler_state`)
+- Data generation upgrade:
+  - single-session -> multi-session sampling
+  - rolling progress bar + ETA in `data/generate.py`
 
-* **Core Solver**: Vectorized WENO5 implementation with Lax-Friedrichs flux splitting and TVD RK3 time integration.
-* **Residual Learning**: Uses KAN to predict numerical errors based on local stencils.
-* **Advanced Strategy**: Implements **Multi-step Tendency Learning** (predicting cumulative error over 10 steps) to improve stability.
-* **Physics-Aware**: Includes conservation enforcement and shock-capturing weighted loss functions.
+## Project Structure
 
-##  Project Structure
+```text
+.
+├── config/
+│   ├── default_config.yaml      # 默认完整配置（含中文注释）
+│   └── example_config.yaml      # 只覆盖部分字段的示例
+├── data/
+│   └── generate.py              # 多会话数据生成 + 进度条/ETA
+├── kan/
+│   ├── model.py                 # Gated KAN / gate 输入构造
+│   ├── scalers.py               # HybridScaler
+│   └── losses.py
+├── solvers/
+│   └── weno.py                  # WENO5 + RK3
+├── utils/
+│   └── config.py                # YAML 加载、递归合并、seed
+├── train.py                     # 配置驱动训练
+├── evaluate.py                  # 配置驱动 rollout + 诊断绘图
+├── rollout.py                   # evaluate 包装入口
+├── dev_log.md                   # 开发日志
+└── requirements.txt
+```
 
-* `burgers_weno.py`: The core numerical engine (WENO5 + RK3).
-* `generate_residual_dataset.py`: Generates training data (coarse grid vs. fine grid ground truth).
-* `train_kan_residual.py`: Trains the KAN model to predict error residuals.
-* `rollout_comparison.py`: Runs the ablation study and visualizes the performance (Baseline vs. Hybrid).
-
-##  Quick Start
-
-### 1. Prerequisites
-Ensure you have `torch`, `numpy`, `matplotlib`, and `scikit-learn` installed.
+## Installation
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Workflow
+## End-to-End Workflow
 
-**Step 1: Generate Dataset**
-Run this script to generate 10-step accumulated error data. It uses a 9-point stencil.
+1. Inspect/prepare config
 ```bash
-python generate_residual_dataset.py
-````
+# 使用默认配置
+python train.py
 
-_Output: `kan_train_data_multistep.npz`_
-
-**Step 2: Train KAN Model**
-
-Train the residual correction network using a Weighted MSE loss (focusing on shocks).
-
-Bash
-
-```
-python train_kan_residual.py
+# 使用自定义覆盖配置
+python train.py --config config/example_config.yaml
 ```
 
-_Output: `kan_model_multistep.pth`_
+2. Generate dataset (multi-session)
+```bash
+# 默认配置生成
+python -m data.generate
 
-**Step 3: Verification (Rollout)**
-
-Run the comparative simulation to see the hybrid solver in action.
-
-Bash
-
-```
-python rollout_comparison.py
+# 自定义配置生成
+python -m data.generate --config config/example_config.yaml
 ```
 
-_Output: `rollout_v2_result.png`_
+3. Train
+```bash
+python train.py --config config/example_config.yaml
+```
 
-##  Results
+4. Evaluate / rollout
+```bash
+python evaluate.py --config config/example_config.yaml
+# 或
+python rollout.py --config config/example_config.yaml
+```
 
-The hybrid solver (WENO5 + KAN) demonstrates significant improvement over the standard coarse-grid WENO5 solver, particularly in maintaining shock sharpness and reducing phase error over long integration times.
+## Gate Evaluation / Ablation Workflow
 
+Configure `ablation.gate_mode` in YAML:
+- `original`: `effective_gate = raw_gate * hard_mask`
+- `raw_gate_only`: `effective_gate = raw_gate`
+- `gate_open`: `effective_gate = 1`
+- `soft_mask` (default): `effective_gate = raw_gate * soft_mask`
+
+Useful debug options:
+- `logging.debug_rollout: true`
+- `logging.debug_t_start: 1.0`
+
+When debug is enabled, evaluation logs:
+- raw/effective gate stats
+- mask active ratio
+- shock indicator stats
+- correction magnitude vs baseline update magnitude
+
+Plot output (`paths.evaluation_plot_path`) includes:
+- top panel: baseline vs hybrid L2 error
+- bottom panel: raw/effective gate, mask ratio, correction magnitude
+
+## Data Features
+
+Current physics feature vector:
+
+```text
+[u_x, |u_x|, |u_xx|, grad_var, dt, sin(t), cos(t)]
+```
+
+## Checkpoint Contents
+
+Saved by `train.py`:
+- `model_state_dict`
+- `scaler_state` (input scaler)
+- `target_scaler_state` (target affine scaler, if enabled)
+- `stencil_size`, `phys_dim`, `steps_ahead`
+- `config` snapshot
+
+## Testing
+
+```bash
+python -m pytest
+python -m tests.convergence
+```

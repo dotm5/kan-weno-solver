@@ -1,6 +1,8 @@
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from burgers_weno import rk3_step
+from solvers.weno import rk3_step
 
 def solve_burgers_inviscid(N, T_final, cfl=0.1):
     """辅助函数：运行一次完整模拟"""
